@@ -34,7 +34,7 @@ Supply chains often experience delays between actual yard movements and updates 
 2. Install dependencies with `pip install -r requirements.txt`.
 3. Set up your AWS CLI with the right IAM credentials (`aws configure`) for DynamoDB access.
 4. Start the dashboard using `streamlit run app.py`.
-5. Run the engine scripts (`gate_arrival.py`, `hostler.py`, and `outgate.py`) in separate terminals.
+5. Run the engine scripts (`main.py`, `hostler.py`, and `outgate.py`) in separate terminals.
 
 
 ## Simulated Business Outcomes
