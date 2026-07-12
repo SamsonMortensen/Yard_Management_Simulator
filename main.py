@@ -1,25 +1,38 @@
-import boto3
 import random
-import uuid
 from datetime import datetime, timezone
 
+from boto3.dynamodb.conditions import Attr
+from botocore.exceptions import ClientError
+
+from config import MIN_SPOT, MAX_SPOT, get_table, scan_all
+
 #Initialize the DynamoDB connection
-dynamodb = boto3.resource('dynamodb', region_name='us-west-2')
-table = dynamodb.Table('Yard_Inventory_Sim')
+table = get_table()
 
-#Define our equipment types and yard spot range
+#Define our equipment types
 equipment_types = ["53_Dry_Van", "40_High_Cube", "20_Standard", "Chassis_Bare"]
-MIN_SPOT = 1000
-MAX_SPOT = 5000
 
-def generate_arrival():
+def get_occupied_spots():
+    #A spot is only free once its container has departed
+    items = scan_all(
+        table,
+        FilterExpression=Attr('Current_Status').ne('Departed'),
+        ProjectionExpression='Assigned_Spot'
+    )
+    return {int(item['Assigned_Spot']) for item in items}
+
+def generate_arrival(occupied_spots):
     # Create a dummy container ID
     prefix = random.choice(["MSKU", "JBHT", "SCHN", "EMCU"])
     container_id = f"{prefix}{random.randint(1000000, 9999999)}"
-    
-    #Assign spot
-    assigned_spot = random.randint(MIN_SPOT, MAX_SPOT)
-    
+
+    #Assign a spot no other active container holds
+    free_spots = set(range(MIN_SPOT, MAX_SPOT + 1)) - occupied_spots
+    if not free_spots:
+        raise RuntimeError("Yard is full — no free spots left to assign.")
+    assigned_spot = random.choice(sorted(free_spots))
+    occupied_spots.add(assigned_spot)
+
     #Build the payload
     item = {
         'Container_ID': container_id,
@@ -27,18 +40,28 @@ def generate_arrival():
         'Current_Status': 'Ingate_Hold',
         'Assigned_Spot': assigned_spot,
         'Arrival_Time': datetime.now(timezone.utc).isoformat(),
-        'Dwell_Time_Hours': 0
     }
     return item
 
 def push_to_cloud(num_containers):
     print(f"Generating {num_containers} new arrivals at the gate...")
+    occupied_spots = get_occupied_spots()
+
     for _ in range(num_containers):
-        new_container = generate_arrival()
-        
-        # Push to DynamoDB
-        table.put_item(Item=new_container) 
-        
+        new_container = generate_arrival(occupied_spots)
+
+        try:
+            # Push to DynamoDB — refuse to overwrite an existing container record
+            table.put_item(
+                Item=new_container,
+                ConditionExpression='attribute_not_exists(Container_ID)'
+            )
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
+                print(f"ID collision on {new_container['Container_ID']} — skipping this arrival.")
+                continue
+            raise
+
         print(f"Arrived: {new_container['Container_ID']} | Spot: {new_container['Assigned_Spot']}")
 
 # Simulate 5 trucks pulling up to the gate
