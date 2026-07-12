@@ -68,7 +68,7 @@ By implementing this cloud-native architecture, terminal operators can expect to
 * **Real-Time Capacity Visibility:** Transitioning from batch-processed spreadsheets to an event-driven DynamoDB pipeline reduces visibility latency to near-zero, allowing dispatchers to accurately gauge yard utilization and average dwell times by the minute.
 
 * **Sample session (simulated):** [N] containers ingated across a shift, parked by two
-concurrent hostler processes with **zero double-parks** ([X] write conflicts detected and
+concurrent hostler processes ([X] write conflicts detected and
 resolved by conditional writes), [K] departures logged, average dwell [H] hours, and the
 TAS denied [D] dry-run attempts.
 
