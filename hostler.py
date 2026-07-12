@@ -36,7 +36,8 @@ def move_container():
     table.update_item(
         Key={'Container_ID': container_id},
         UpdateExpression="set Current_Status = :s, Parked_By_Employee =:e",
-        ExpressionAttributeValues={':s': 'Parked', ':e': driver}
+        ExpressionAttributeValues={':s': 'Parked', ':e': driver},
+        ConditionExpression = Attr('Current_Status).eq('Ingate_Hold')
     )
 
     print(f"Dropped {container_id} at parking spot {assigned_spot}\n")
