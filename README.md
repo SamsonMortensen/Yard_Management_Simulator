@@ -33,8 +33,28 @@ Supply chains often experience delays between actual yard movements and updates 
 1. Clone the repo.
 2. Install dependencies with `pip install -r requirements.txt`.
 3. Set up your AWS CLI with the right IAM credentials (`aws configure`) for DynamoDB access.
-4. Start the dashboard using `streamlit run app.py`.
-5. Run the engine scripts (`main.py`, `hostler.py`, and `outgate.py`) in separate terminals.
+4. Create the table: `python setup_table.py`.
+5. Start the dashboard using `streamlit run app.py`.
+6. Run the engine scripts (`main.py`, `hostler.py`, and `outgate.py`) in separate terminals.
+
+
+## Concurrency & Scaling Considerations
+
+**Optimistic concurrency.** Multiple hostler and outgate processes poll the same table, so two
+workers can target the same container. Every state transition uses a DynamoDB conditional write
+(`ConditionExpression` on the current status): the transition is atomic, exactly one writer
+succeeds, and the loser catches `ConditionalCheckFailedException` and rescans. No locks, no
+coordinator process.
+
+**Scan vs. Query.** The engines poll with `Scan` + `FilterExpression`, which reads the entire
+table and filters afterward — fine at demo scale, but read cost grows linearly with table size.
+The production design is a Global Secondary Index keyed on `Current_Status`, letting each engine
+`Query` only the items in the state it cares about. The scans are kept here to keep the demo to
+a single table; the GSI refactor is on the roadmap.
+
+**Pagination.** DynamoDB returns at most 1 MB per scan page. All scans go through a shared
+helper that follows `LastEvaluatedKey`, so results stay complete no matter how large the
+table grows.
 
 
 ## Simulated Business Outcomes
@@ -46,6 +66,12 @@ By implementing this cloud-native architecture, terminal operators can expect to
 * **Granular Accountability:** Decoupling the public dispatch view from the internal AWS database ensures that every physical yard move is permanently tied to a specific hostler (e.g., EMP-309), providing management with an immutable audit trail for damage claims or misparks.
 
 * **Real-Time Capacity Visibility:** Transitioning from batch-processed spreadsheets to an event-driven DynamoDB pipeline reduces visibility latency to near-zero, allowing dispatchers to accurately gauge yard utilization and average dwell times by the minute.
+
+* **Sample session (simulated):** [N] containers ingated across a shift, parked by two
+concurrent hostler processes with **zero double-parks** ([X] write conflicts detected and
+resolved by conditional writes), [K] departures logged, average dwell [H] hours, and the
+TAS denied [D] dry-run attempts.
+
 
 ## Future Roadmap & Suggested Enhancements
 
