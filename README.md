@@ -35,7 +35,11 @@ Supply chains often experience delays between actual yard movements and updates 
 3. Set up your AWS CLI with the right IAM credentials (`aws configure`) for DynamoDB access.
 4. Create the table: `python setup_table.py`.
 5. Start the dashboard using `streamlit run app.py`.
-6. Run the engine scripts (`main.py`, `hostler.py`, and `outgate.py`) in separate terminals.
+6. Run the engine scripts in separate terminals:
+   - `python main.py` drops units at the gate (pass a count, e.g. `python main.py 20`).
+   - `python hostler.py` works the gate queue until it's clear, then clocks out.
+   - `python outgate.py` pulls parked units off the ground until the yard is empty, then clocks out.
+7. Check a unit against the TAS with `python dispatch_check.py`. Grab a `Container_ID` off the dashboard roster when it asks.
 
 
 ## Concurrency & Scaling Considerations

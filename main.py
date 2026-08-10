@@ -1,4 +1,5 @@
 import random
+import sys
 from datetime import datetime, timezone
 
 from boto3.dynamodb.conditions import Attr
@@ -64,5 +65,7 @@ def push_to_cloud(num_containers):
 
         print(f"Arrived: {new_container['Container_ID']} | Spot: {new_container['Assigned_Spot']}")
 
-# Simulate 5 trucks pulling up to the gate
-push_to_cloud(5)
+if __name__ == "__main__":
+    # Simulate trucks pulling up to the gate (default 5)
+    count = int(sys.argv[1]) if len(sys.argv) > 1 else 5
+    push_to_cloud(count)

@@ -52,13 +52,18 @@ def move_container():
     print(f"Dropped {container_id} at parking spot {assigned_spot}\n")
     return True
 
-# Run the Hostler Shift
-print("Starting Hostler Shift..")
-try:
-    while True:
-        moved = move_container()
-        if not moved:
-            break # Clock out if the gate is empty
-        time.sleep(3) # Short break between moves
-except KeyboardInterrupt:
-    print("\nShift ended early — hostler clocking out.")
+def run_shift():
+    # Run the Hostler Shift
+    print("Starting Hostler Shift..")
+    try:
+        while True:
+            moved = move_container()
+            if not moved:
+                break # Clock out if the gate is empty
+            time.sleep(3) # Short break between moves
+    except KeyboardInterrupt:
+        print("\nShift ended early — hostler clocking out.")
+
+
+if __name__ == "__main__":
+    run_shift()

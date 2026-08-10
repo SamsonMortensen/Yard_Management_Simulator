@@ -54,13 +54,18 @@ def process_outgate():
     print(f"Final Dwell Time logged: {dwell_hours} hours.\n")
     return True
 
-# Run the Outgate Shift
-print("Starting Outgate Shift...")
-try:
-    while True:
-        moved = process_outgate()
-        if not moved:
-            break # Clock out if the yard is empty
-        time.sleep(4) # break before the next truck arrives
-except KeyboardInterrupt:
-    print("\nShift ended early — outgate clocking out.")
+def run_shift():
+    # Run the Outgate Shift
+    print("Starting Outgate Shift...")
+    try:
+        while True:
+            moved = process_outgate()
+            if not moved:
+                break # Clock out if the yard is empty
+            time.sleep(4) # break before the next truck arrives
+    except KeyboardInterrupt:
+        print("\nShift ended early — outgate clocking out.")
+
+
+if __name__ == "__main__":
+    run_shift()
