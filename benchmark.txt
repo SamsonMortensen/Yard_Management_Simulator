@@ -1,0 +1,20 @@
+
+  Empirical Benchmark: Concurrency Guards vs Unsafe Baseline
+  Workload: 60 containers | 2 hostlers | 1 outgate | 10 repeat runs each
+  ==============================================================================
+  Operational Mode      FIFO?  Park Writes  Double-Parks  Conflicts Intercepted
+  ------------------------------------------------------------------------------
+  Unsafe Blind Writes    Yes      107.9         47.9          0.0 (Blind Overwrite)
+  Guarded FIFO (head)    Yes       60.0          0.0         59.1 (Misparks Prevented)
+  Random Draw (random)   No        60.0          0.0          2.6 (Reduced Contention)
+  Dispatch (pre-claim)   Yes       60.0          0.0          0.0 (0 Conflicts)
+  ==============================================================================
+
+  Analytical Findings:
+  1. The Unsafe control mode proves concurrency guards are load-bearing: without them,
+     two workers produce 47.9 duplicate park writes across 60 containers.
+  2. Under Guarded FIFO, the conflict count is not mere overhead: it is the exact
+     count of physical double-parks intercepted and prevented by DynamoDB.
+  3. Centralized Dispatch moves contention off the expensive physical drive path
+     onto the in-memory claim retry, achieving 0 parking collisions while preserving FIFO.
+

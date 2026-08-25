@@ -288,19 +288,15 @@ def render_comparison(unsafe_res, head_res, rand_res, disp_res, containers=60):
     lines.append("  Operational Mode      FIFO?  Park Writes  Double-Parks  Conflicts Intercepted")
     lines.append("  " + "-" * 78)
 
-    unsafe_parks = f"~{unsafe_res['min_successful_parks']}-{unsafe_res['max_successful_parks']}"
-    unsafe_dbl = f"~{unsafe_res['min_double_parks']}-{unsafe_res['max_double_parks']}"
-    fifo_conflicts = f"~{head_res['min_conflicts']}-{head_res['max_conflicts']}"
-
-    lines.append(f"  Unsafe Blind Writes    Yes     {unsafe_parks:>9}     {unsafe_dbl:>9}          0 (Blind Overwrite)")
-    lines.append(f"  Guarded FIFO (head)    Yes            60             0       {fifo_conflicts:>8} (Misparks Prevented)")
-    lines.append(f"  Random Draw (random)   No             60             0          {rand_res['mean_conflicts']:>3.1f} (Reduced Contention)")
-    lines.append(f"  Dispatch (pre-claim)   Yes            60             0            0 (0 Conflicts)")
+    lines.append(f"  Unsafe Blind Writes    Yes      {unsafe_res['mean_successful_park_writes']:>5.1f}        {unsafe_res['mean_double_parks']:>5.1f}         {unsafe_res['mean_conflicts']:>4.1f} (Blind Overwrite)")
+    lines.append(f"  Guarded FIFO (head)    Yes      {head_res['mean_successful_park_writes']:>5.1f}        {head_res['mean_double_parks']:>5.1f}        {head_res['mean_conflicts']:>5.1f} (Misparks Prevented)")
+    lines.append(f"  Random Draw (random)   No       {rand_res['mean_successful_park_writes']:>5.1f}        {rand_res['mean_double_parks']:>5.1f}         {rand_res['mean_conflicts']:>4.1f} (Reduced Contention)")
+    lines.append(f"  Dispatch (pre-claim)   Yes      {disp_res['mean_successful_park_writes']:>5.1f}        {disp_res['mean_double_parks']:>5.1f}         {disp_res['mean_conflicts']:>4.1f} (0 Conflicts)")
     lines.append("  " + "=" * 78)
     lines.append("")
     lines.append("  Analytical Findings:")
     lines.append("  1. The Unsafe control mode proves concurrency guards are load-bearing: without them,")
-    lines.append(f"     two workers produce {unsafe_dbl} duplicate park writes across {containers} containers.")
+    lines.append(f"     two workers produce {unsafe_res['mean_double_parks']:.1f} duplicate park writes across {containers} containers.")
     lines.append("  2. Under Guarded FIFO, the conflict count is not mere overhead: it is the exact")
     lines.append("     count of physical double-parks intercepted and prevented by DynamoDB.")
     lines.append("  3. Centralized Dispatch moves contention off the expensive physical drive path")
@@ -351,7 +347,11 @@ def main():
         disp = repeat_shifts(runs=10, containers=args.containers, hostlers=args.hostlers,
                              outgates=args.outgates, claim="dispatch", unsafe=False,
                              speed=args.speed, page_size=args.page_size, seed=args.seed)
-        print(render_comparison(unsafe_res, head, rand, disp, containers=args.containers))
+        out = render_comparison(unsafe_res, head, rand, disp, containers=args.containers)
+        print(out)
+        with open("benchmark.txt", "w", encoding="utf-8") as f:
+            f.write(out + "\n")
+        print("\n  [EXPORT] Benchmark results written to benchmark.txt")
         return 0
 
     if args.repeat > 1:

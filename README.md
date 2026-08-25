@@ -72,19 +72,21 @@ python test_yard.py                            # 48 unit and integration tests
 A concurrency design is only as credible as the failure it prevents. To prove that DynamoDB conditional writes are load-bearing, the simulator includes an uncoordinated control mode (`--unsafe`) that runs the identical 60-container shift with conditional writes removed.
 
 **Empirical Benchmark (reproduce with `python simulate.py --compare`):**
-Measured across 10 repeat runs per mode on a 60-container shift with 2 hostlers and 1 outgate:
+State space guarantees across all runs for a 60-container shift with 2 hostlers and 1 outgate:
 
 | Operational Mode | FIFO Preserved? | Successful Park Writes | Duplicate Misparks | Conflicts Intercepted |
 | :--- | :---: | :---: | :---: | :---: |
-| **Unsafe Blind Writes (`--unsafe`)** | **Yes** | **~114-117** (Expected: 60) | **~54-57 of 60** | **0 (Blind Overwrite)** |
-| **Guarded FIFO (`--claim head`)** | **Yes** | **60** (Expected: 60) | **0 of 60** | **~46-60 (Misparks Prevented)** |
-| **Random Draw (`--claim random`)** | **No** | **60** (Expected: 60) | **0 of 60** | **~2.5** |
-| **Centralized Dispatch (`--claim dispatch`)** | **Yes** | **60** (Expected: 60) | **0 of 60** | **0 (0 Conflicts)** |
+| **Unsafe Blind Writes (`--unsafe`)** | **Yes** | **> 60** (Expected: 60) | **> 0** | **0 (Blind Overwrite)** |
+| **Guarded FIFO (`--claim head`)** | **Yes** | **Exactly 60** | **Exactly 0** | **<= 60 (Misparks Prevented)** |
+| **Random Draw (`--claim random`)** | **No** | **Exactly 60** | **Exactly 0** | **< 60 (Reduced Contention)** |
+| **Centralized Dispatch (`--claim dispatch`)** | **Yes** | **Exactly 60** | **Exactly 0** | **0 (0 Conflicts)** |
+
+*For exact numeric distributions from a recorded run, see [benchmark.txt](benchmark.txt) (recorded on Python 3.14 / Windows).*
 
 ### Analytical Breakdown:
 
-1. **The Unsafe Control Proves Causality:** Without conditional writes, both hostlers read the queue, drive simultaneously, and blindly overwrite container records. Across 60 containers, this executes ~114-117 park writes and leaves ~54-57 containers double-parked with split-brain employee logs. Zero database conflicts are raised, but data integrity is silently broken.
-2. **Reframing Write Contention:** Under Guarded FIFO, the detected conflict count (~46 to 60) is not mere overhead: **it is the exact count of physical misparks intercepted and prevented by the database**. 60 is the mathematical contention ceiling (one lost race per container under 2 concurrent workers). Thread timing causes variance across machines, but correctness held across 100% of runs.
+1. **The Unsafe Control Proves Causality:** Without conditional writes, both hostlers read the queue, drive simultaneously, and blindly overwrite container records. Across 60 containers, this executes more than 60 park writes and leaves multiple containers double-parked with split-brain employee logs. Zero database conflicts are raised, but data integrity is silently broken.
+2. **Reframing Write Contention:** Under Guarded FIFO, the detected conflict count is bounded by [0, 60] and is not mere overhead: **it is the exact count of physical misparks intercepted and prevented by the database**. 60 is the mathematical contention ceiling (one lost race per container under 2 concurrent workers). Thread timing causes variance across machines, but correctness holds across 100% of runs.
 3. **Queue Strategy Optimization:**
    - **Random Draw (`--claim random`)** reduces collisions by 20x, but breaks FIFO arrival order.
    - **Centralized Dispatch (`--claim dispatch`)** moves contention off the expensive physical drive path onto the in-memory claim retry, achieving 0 parking collisions while preserving strict customer arrival order.
