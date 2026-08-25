@@ -86,7 +86,7 @@ def run_shift(containers=60, hostlers=2, outgates=1, claim="head",
 
         # TAS verification on grounded units before departure
         parked = [i["Container_ID"] for i in table.all_items()
-                  if i["Current_Status"] == "Parked"]
+                  if i.get("Current_Status") == "Parked"]
         parked_sample = parked[:1] if parked else []
         approved_count = sum(1 if dispatch_check.check_appointment(cid) else 0
                              for cid in parked_sample)
@@ -350,6 +350,8 @@ def main():
         out = render_comparison(unsafe_res, head, rand, disp, containers=args.containers)
         print(out)
         with open("benchmark.txt", "w", encoding="utf-8") as f:
+            import datetime, sys, platform
+            f.write(f"Generated on {datetime.datetime.now().strftime('%Y-%m-%d')} | Python {sys.version.split()[0]} | {platform.system()}\n")
             f.write(out + "\n")
         print("\n  [EXPORT] Benchmark results written to benchmark.txt")
         return 0

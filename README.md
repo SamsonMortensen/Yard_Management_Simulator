@@ -88,10 +88,10 @@ State space guarantees across all runs for a 60-container shift with 2 hostlers 
 1. **The Unsafe Control Proves Causality:** Without conditional writes, both hostlers read the queue, drive simultaneously, and blindly overwrite container records. Across 60 containers, this executes more than 60 park writes and leaves multiple containers double-parked with split-brain employee logs. Zero database conflicts are raised, but data integrity is silently broken.
 2. **Reframing Write Contention:** Under Guarded FIFO, the detected conflict count is bounded by [0, 60] and is not mere overhead: **it is the exact count of physical misparks intercepted and prevented by the database**. 60 is the mathematical contention ceiling (one lost race per container under 2 concurrent workers). Thread timing causes variance across machines, but correctness holds across 100% of runs.
 3. **Queue Strategy Optimization:**
-   - **Random Draw (`--claim random`)** reduces collisions by 20x, but breaks FIFO arrival order.
+   - **Random Draw (`--claim random`)** breaks FIFO arrival order but scales much better: FIFO conflicts scale with the container count (ceiling = N, one lost race per unit), while random-draw conflicts stay near-constant as N grows.
    - **Centralized Dispatch (`--claim dispatch`)** moves contention off the expensive physical drive path onto the in-memory claim retry, achieving 0 parking collisions while preserving strict customer arrival order.
 
-**Scan cost, measured:** that same 60-container shift issued 184 scans across 550 pages and read **10,980 rows before filtering** (183 rows read per container actually in the yard). Every scan reads the whole table, including units that departed hours ago. That multiple is the argument for the Global Secondary Index at the top of the roadmap, and it is now a number rather than a claim.
+**Scan cost, measured:** A filtered scan reads every row in the table and pays for every row, regardless of how many match. That is the entire argument for the Global Secondary Index at the top of the roadmap, and `test_scan_counts_rows_read_before_filtering` proves it deterministically by reading 40 rows to return exactly 1. Total shift scan counts are recorded alongside the benchmarking output in `benchmark.txt`.
 
 
 ## Future Roadmap & Suggested Enhancements
@@ -99,8 +99,6 @@ State space guarantees across all runs for a 60-container shift with 2 hostlers 
 Four known limits in the current build, in the order I would fix them:
 
 * **Move the status lookups off `Scan`.** The engines scan the whole table and filter for `Ingate_Hold` or `Parked` afterward, so every pass reads, and pays for, every row, including units that outgated weeks ago. A Global Secondary Index on `Current_Status` turns each of those into a `Query` that only touches the units the worker actually wants. `scan_all()` handles pagination correctly in the meantime so nothing is silently dropped, but the read cost grows linearly with the table and this is the first thing that breaks at real volume.
-
-* **Prevent double-spot assignment during concurrent ingates.** Currently `main.py` takes a point-in-time snapshot of occupied spots and assigns free spots locally. If multiple gate clerks run at the exact same second, they can assign the same spot to different container IDs because the primary key is `Container_ID` rather than `Assigned_Spot`. In `test_yard.py`, running two concurrent gate clerks empirically creates spot collisions (e.g. 15 duplicate spot assignments across 30 units). In production, spot assignment should be managed via a dedicated spots partition or deferred until the hostler grounds the unit.
 
 * **Build a real audit trail on DynamoDB Streams.** `Parked_By_Employee` is stamped onto the container record, so a later move overwrites the earlier one and only the most recent hostler is on file. Piping the table's stream into an append-only move log gives management the full chain of custody a damage claim actually needs.
 

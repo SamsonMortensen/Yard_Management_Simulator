@@ -236,6 +236,13 @@ class MockTable:
                 return {}
             return {"Item": deepcopy(item)}
 
+    def delete_item(self, Key):
+        key_val = Key.get(self.key_name)
+        with self._lock:
+            if key_val in self._items:
+                del self._items[key_val]
+            return {"ResponseMetadata": {"HTTPStatusCode": 200}}
+
     def put_item(self, Item, ConditionExpression=None, ExpressionAttributeValues=None):
         key_val = Item.get(self.key_name)
         if key_val is None:

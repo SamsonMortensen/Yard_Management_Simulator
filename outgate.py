@@ -50,6 +50,9 @@ def process_outgate():
             return True
         raise
 
+    # Release the spot lock
+    table.delete_item(Key={'Container_ID': f"SPOT#{container['Assigned_Spot']}"})
+
     print(f"{container_id} has left the yard.")
     print(f"Final Dwell Time logged: {dwell_hours} hours.\n")
     return True

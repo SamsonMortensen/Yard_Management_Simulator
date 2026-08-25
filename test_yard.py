@@ -335,37 +335,35 @@ def test_dispatch_strategy_eliminates_parking_conflicts():
 
 
 def test_concurrent_gate_clerks_spot_collision():
-    """Empirically reproduces roadmap item 2: concurrent gate clerks taking spot
-    snapshots can allocate duplicate spots because table partitions on Container_ID."""
+    """Empirically verifies that conditional spot reservation prevents duplicate
+    spot allocation under concurrent gate clerks."""
     table = mock_dynamo.reset_shared_table()
     import main as ingate_engine
-    import random
+    import threading, sys, os
 
-    # Clerk 1 terminal takes a snapshot at shift start
-    random.seed(42)
-    occupied_1 = ingate_engine.get_occupied_spots()
-    arrivals_1 = [ingate_engine.generate_arrival(occupied_1) for _ in range(15)]
+    def run_clerk():
+        old_stdout = sys.stdout
+        sys.stdout = open(os.devnull, 'w')
+        try:
+            ingate_engine.push_to_cloud(15)
+        finally:
+            sys.stdout.close()
+            sys.stdout = old_stdout
 
-    # Clerk 2 terminal concurrently takes the same snapshot at gate lane 2
-    random.seed(42)
-    occupied_2 = ingate_engine.get_occupied_spots()
-    arrivals_2 = []
-    for _ in range(15):
-        item = ingate_engine.generate_arrival(occupied_2)
-        # Distinct physical truck ID at lane 2
-        item["Container_ID"] = "LANE2_" + item["Container_ID"]
-        arrivals_2.append(item)
+    t1 = threading.Thread(target=run_clerk)
+    t2 = threading.Thread(target=run_clerk)
+    
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
 
-    # Both clerks commit to DynamoDB (which succeeds because Container_ID is unique)
-    for item in arrivals_1 + arrivals_2:
-        table.put_item(Item=item)
-
-    items = table.all_items()
+    items = [i for i in table.all_items() if not i.get("Container_ID", "").startswith("SPOT#")]
     spots = [i["Assigned_Spot"] for i in items]
     unique_spots = set(spots)
     collisions = len(spots) - len(unique_spots)
-    check("snapshot spot allocation creates collisions under concurrent clerks",
-          collisions > 0, f"{collisions} duplicate spot assignments across {len(items)} containers")
+    check("conditional spot allocation strictly prevents collisions under concurrent clerks",
+          collisions == 0, f"{collisions} duplicate spot assignments across {len(items)} containers")
 
 
 def main():
