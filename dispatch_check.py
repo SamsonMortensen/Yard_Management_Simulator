@@ -23,7 +23,7 @@ def check_appointment(container_id):
         spot = item.get('Assigned_Spot')
 
         #Edge Case 2: In yard, but not grounded (waiting on hostler)
-        if status == 'Ingate_Hold':
+        if status in ('Ingate_Hold', 'Claimed'):
             print("Appointment Pending.")
             print("Reason: Unit is at the facility but still on wheels/holding. Driver must wait.\n")
             return False
@@ -40,7 +40,7 @@ def check_appointment(container_id):
             print("Reason: Container has already outgated from the facility.\n")
             return False
 
-        #Edge Case 4: Status we don't recognize — deny rather than guess
+        #Edge Case 4: Status we don't recognize: deny rather than guess
         print("Appointment Denied.")
         print(f"Reason: Unit is in an unrecognized status ({status}). Escalate to the tower.\n")
         return False

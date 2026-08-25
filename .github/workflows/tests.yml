@@ -1,0 +1,49 @@
+# Runs the full simulation and test suite against the in-memory backend.
+#
+# No AWS credentials are needed or used. That is the point: the engines run
+# unmodified against `mock_dynamo.py`, so CI exercises the same code paths that
+# would run against DynamoDB without provisioning anything.
+
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Test suite
+        run: python test_yard.py
+
+      # A shift must complete correctly, not merely without raising. simulate.py
+      # exits non-zero if exactly-once is violated or the TAS lets a dry run
+      # through, so this is a real assertion rather than a smoke test.
+      - name: Full shift, FIFO claim strategy
+        run: python simulate.py --containers 40 --hostlers 3 --speed 0
+
+      - name: Full shift, random claim strategy
+        run: python simulate.py --containers 40 --hostlers 3 --speed 0 --claim random
+
+      - name: Repeated shifts hold correctness every run
+        run: python simulate.py --containers 30 --hostlers 3 --speed 0 --repeat 5

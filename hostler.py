@@ -1,3 +1,4 @@
+import os
 import random
 import time
 
@@ -12,6 +13,12 @@ table = get_table()
 #Shift Roster (employee IDs)
 active_hostlers = ["EMP-104", "EMP-227", "EMP-309", "EMP-412"]
 
+def claim_strategy():
+    return os.environ.get("YMS_CLAIM", "head").lower()
+
+def is_unsafe():
+    return os.environ.get("YMS_UNSAFE", "false").lower() == "true"
+
 def move_container():
     # Scan the database for units at the gate
     gate_items = scan_all(
@@ -23,20 +30,67 @@ def move_container():
         print("Yard is clear. No containers waiting at the gate.")
         return False
 
-    #Grab the first container in line
-    container = gate_items[0]
+    driver = random.choice(active_hostlers)
+    strategy = claim_strategy()
+    unsafe = is_unsafe()
+
+    if strategy == "dispatch" and not unsafe:
+        #Centralized Task Assignment: claim before driving
+        container_id = None
+        assigned_spot = None
+        for candidate in gate_items:
+            candidate_id = candidate['Container_ID']
+            try:
+                table.update_item(
+                    Key={'Container_ID': candidate_id},
+                    UpdateExpression="set Current_Status = :s, Claimed_By = :e",
+                    ExpressionAttributeValues={':s': 'Claimed', ':e': driver},
+                    ConditionExpression=Attr('Current_Status').eq('Ingate_Hold')
+                )
+                container_id = candidate_id
+                assigned_spot = candidate['Assigned_Spot']
+                break
+            except ClientError as e:
+                if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
+                    continue
+                raise
+
+        if not container_id:
+            return True
+
+        print(f"Hostler dispatch assigned {container_id} to {driver} (pre-claimed).")
+        time.sleep(2) # Simulating physical drive time
+
+        table.update_item(
+            Key={'Container_ID': container_id},
+            UpdateExpression="set Current_Status = :s, Parked_By_Employee = :e",
+            ExpressionAttributeValues={':s': 'Parked', ':e': driver},
+            ConditionExpression=Attr('Current_Status').eq('Claimed')
+        )
+        print(f"Dropped {container_id} at parking spot {assigned_spot}\n")
+        return True
+
+    #Grab container per head or random strategy
+    container = random.choice(gate_items) if strategy == "random" else gate_items[0]
     container_id = container['Container_ID']
     assigned_spot = container['Assigned_Spot']
 
-    #Assign a driver
-    driver = random.choice(active_hostlers)
-
     print(f"Hostler dispatching to Gate... Grabbing {container_id}")
-    time.sleep(2) # Simulating the physical drive time
+    time.sleep(2) # Simulating physical drive time
+
+    if unsafe:
+        #UNSAFE CONTROL MODE: blind update without ConditionExpression.
+        #Demonstrates race conditions: both hostlers write to the same record.
+        table.update_item(
+            Key={'Container_ID': container_id},
+            UpdateExpression="set Current_Status = :s, Parked_By_Employee = :e",
+            ExpressionAttributeValues={':s': 'Parked', ':e': driver}
+        )
+        print(f"[UNSAFE] Dropped {container_id} at spot {assigned_spot} (blind overwrite by {driver})\n")
+        return True
 
     try:
-        #Conditional write: only lands if the unit is still at the gate.
-        #If another hostler parked it during our drive, DynamoDB rejects this.
+        #GUARDED MODE: Conditional write ensures atomic transition.
         table.update_item(
             Key={'Container_ID': container_id},
             UpdateExpression="set Current_Status = :s, Parked_By_Employee = :e",
@@ -62,7 +116,7 @@ def run_shift():
                 break # Clock out if the gate is empty
             time.sleep(3) # Short break between moves
     except KeyboardInterrupt:
-        print("\nShift ended early — hostler clocking out.")
+        print("\nShift ended early: hostler clocking out.")
 
 
 if __name__ == "__main__":

@@ -5,7 +5,8 @@ from datetime import datetime, timezone
 from boto3.dynamodb.conditions import Attr
 from botocore.exceptions import ClientError
 
-from config import MIN_SPOT, MAX_SPOT, get_table, scan_all
+import config
+from config import get_table, scan_all
 
 #Initialize the DynamoDB connection
 table = get_table()
@@ -28,9 +29,9 @@ def generate_arrival(occupied_spots):
     container_id = f"{prefix}{random.randint(1000000, 9999999)}"
 
     #Assign a spot no other active container holds
-    free_spots = set(range(MIN_SPOT, MAX_SPOT + 1)) - occupied_spots
+    free_spots = set(range(config.MIN_SPOT, config.MAX_SPOT + 1)) - occupied_spots
     if not free_spots:
-        raise RuntimeError("Yard is full — no free spots left to assign.")
+        raise RuntimeError("Yard is full: no free spots left to assign.")
     assigned_spot = random.choice(sorted(free_spots))
     occupied_spots.add(assigned_spot)
 
@@ -52,14 +53,14 @@ def push_to_cloud(num_containers):
         new_container = generate_arrival(occupied_spots)
 
         try:
-            # Push to DynamoDB — refuse to overwrite an existing container record
+            # Push to DynamoDB: refuse to overwrite an existing container record
             table.put_item(
                 Item=new_container,
                 ConditionExpression='attribute_not_exists(Container_ID)'
             )
         except ClientError as e:
             if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
-                print(f"ID collision on {new_container['Container_ID']} — skipping this arrival.")
+                print(f"ID collision on {new_container['Container_ID']}: skipping this arrival.")
                 continue
             raise
 

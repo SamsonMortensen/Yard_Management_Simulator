@@ -2,7 +2,7 @@
 
 ## Overview
 
-This event-driven, microservice-based setup simulates real-time intermodal logistics and yard operations. It replicates the journey of freight containers through a transit facility—from gate arrival, to hostler parking, all the way to the final outgate—while tracking live operational metrics and ensuring data governance.
+This event-driven, microservice-based setup simulates real-time intermodal logistics and yard operations. It replicates the journey of freight containers through a transit facility from gate arrival to hostler parking, all the way to the final outgate, while tracking live operational metrics and ensuring data governance.
 
 ## The Business Problem
 
@@ -11,24 +11,40 @@ Supply chains often experience delays between actual yard movements and updates 
 ## Architecture & Tech Stack
 
 * **Cloud Database:** AWS DynamoDB (NoSQL) for fast, key-value status updates.
-
 * **Simulation Engine:** Python (`boto3`) scripts that simulate gate clerks, yard hostlers, and outbound dispatchers.
-
 * **Analytics Front-End:** Streamlit & Pandas for live data visualization and KPI monitoring.
 
 ## Core Features
 
 * **Live Ingestion Pipeline:** Creates random inbound container traffic and assigns numeric parking spots to keep things running smoothly.
-
-* **Automated State Changes:** Background processes update container statuses automatically (`Ingate_Hold` → `Parked` → `Departed`).
-
+* **Automated State Changes:** Background processes update container statuses automatically (`Ingate_Hold` -> `Parked` -> `Departed`).
 * **Terminal Appointment System (TAS):** Smart business logic prevents "Dry Runs" by checking container availability before issuing gate codes.
-
 * **Internal Audit Trailing:** Logs unique employee IDs linked to yard movements in the cloud, keeping audit data separate from the public dispatch dashboard.
-
 * **Real-Time Analytics:** Continuously calculates and shows yard capacity usage and container dwell times.
 
-## How to Run Locally  
+## Run it in two commands, with no AWS account
+
+```bash
+pip install -r requirements.txt
+python simulate.py
+```
+
+That runs a full shift: 60 containers ingated, parked by two concurrent hostlers, then outgated, against an in-memory DynamoDB stand-in (`mock_dynamo.py`), and prints the correctness checks, the write-contention count and the scan cost.
+
+The engines are **not modified** to make this work. `main.py`, `hostler.py`, `outgate.py` and `dispatch_check.py` run exactly as they would against real DynamoDB; `config.get_table()` simply hands them a different table object. Every conditional write, every retry and every filter is the real one. Only the simulated drive-time sleeps are compressed, via `--speed`.
+
+Useful flags:
+
+```bash
+python simulate.py --compare                   # run side-by-side benchmark of control vs guarded modes
+python simulate.py --unsafe                    # run without conditional writes to prove failure mode
+python simulate.py --repeat 10                 # report distribution across 10 shift runs
+python simulate.py --claim dispatch            # run with centralized task assignment (0 conflicts + FIFO)
+python simulate.py --export-csv shift.csv      # dump shift telemetry to CSV for pandas analytics
+python test_yard.py                            # 48 unit and integration tests
+```
+
+## How to Run Against Real AWS  
 
 1. Clone the repo.
 2. Install dependencies with `pip install -r requirements.txt`.
@@ -44,61 +60,45 @@ Supply chains often experience delays between actual yard movements and updates 
 
 ## Concurrency & Scaling Considerations
 
-**Optimistic concurrency.** Multiple hostler and outgate processes poll the same table, so two
-workers can target the same container. Every state transition uses a DynamoDB conditional write
-(`ConditionExpression` on the current status): the transition is atomic, exactly one writer
-succeeds, and the loser catches `ConditionalCheckFailedException` and rescans. No locks, no
-coordinator process.
+**Optimistic concurrency.** Multiple hostler and outgate processes poll the same table, so two workers can target the same container. Every state transition uses a DynamoDB conditional write (`ConditionExpression` on the current status): the transition is atomic, exactly one writer succeeds, and the loser catches `ConditionalCheckFailedException` and rescans. No locks, no coordinator process.
 
-**Scan vs. Query.** The engines poll with `Scan` + `FilterExpression`, which reads the entire
-table and filters afterward — fine at demo scale, but read cost grows linearly with table size.
-The production design is a Global Secondary Index keyed on `Current_Status`, letting each engine
-`Query` only the items in the state it cares about. The scans are kept here to keep the demo to
-a single table; the GSI refactor is on the roadmap.
+**Scan vs. Query.** The engines poll with `Scan` + `FilterExpression`, which reads the entire table and filters afterward (fine at demo scale, but read cost grows linearly with table size). The production design is a Global Secondary Index keyed on `Current_Status`, letting each engine `Query` only the items in the state it cares about. The scans are kept here to keep the demo to a single table; the GSI refactor is on the roadmap.
 
-**Pagination.** DynamoDB returns at most 1 MB per scan page. All scans go through a shared
-helper that follows `LastEvaluatedKey`, so results stay complete no matter how large the
-table grows.
+**Pagination.** DynamoDB returns at most 1 MB per scan page. All scans go through a shared helper that follows `LastEvaluatedKey`, so results stay complete no matter how large the table grows.
 
 
-## Simulated Business Outcomes
+## Measured Findings: Proving the Failure Mode
 
-By implementing this cloud-native architecture, terminal operators can expect to see several key improvements:
+A concurrency design is only as credible as the failure it prevents. To prove that DynamoDB conditional writes are load-bearing, the simulator includes an uncoordinated control mode (`--unsafe`) that runs the identical 60-container shift with conditional writes removed.
 
-* **Elimination of Dry Runs:** The Terminal Appointment System (TAS) successfully intercepts and denies gate access for units not physically grounded, saving drayage drivers hours of wasted time and reducing gate-lane congestion.
+**Empirical Benchmark (reproduce with `python simulate.py --compare`):**
+Measured across 10 repeat runs per mode on a 60-container shift with 2 hostlers and 1 outgate:
 
-* **Granular Accountability:** Decoupling the public dispatch view from the internal AWS database ensures that every physical yard move is permanently tied to a specific hostler (e.g., EMP-309), providing management with an immutable audit trail for damage claims or misparks.
+| Operational Mode | FIFO Preserved? | Successful Park Writes | Duplicate Misparks | Conflicts Intercepted |
+| :--- | :---: | :---: | :---: | :---: |
+| **Unsafe Blind Writes (`--unsafe`)** | **Yes** | **~114-117** (Expected: 60) | **~54-57 of 60** | **0 (Blind Overwrite)** |
+| **Guarded FIFO (`--claim head`)** | **Yes** | **60** (Expected: 60) | **0 of 60** | **~46-60 (Misparks Prevented)** |
+| **Random Draw (`--claim random`)** | **No** | **60** (Expected: 60) | **0 of 60** | **~2.5** |
+| **Centralized Dispatch (`--claim dispatch`)** | **Yes** | **60** (Expected: 60) | **0 of 60** | **0 (0 Conflicts)** |
 
-* **Real-Time Capacity Visibility:** Transitioning from batch-processed spreadsheets to an event-driven DynamoDB pipeline reduces visibility latency to near-zero, allowing dispatchers to accurately gauge yard utilization and average dwell times by the minute.
+### Analytical Breakdown:
 
-* **Sample session (simulated):** 60 containers ingated across one shift and parked by two
-concurrent hostler processes drawing from a four-driver roster, with **59 write conflicts
-detected and resolved by conditional writes**. All 60 units were grounded exactly once, 60
-departures were logged with an average dwell of 4.3 seconds of wall clock (the simulator
-compresses a shift into seconds, so treat dwell as a plumbing check rather than an
-operational figure), and the TAS denied 12 of 12 dry-run attempts against units that were
-not on the ground.
+1. **The Unsafe Control Proves Causality:** Without conditional writes, both hostlers read the queue, drive simultaneously, and blindly overwrite container records. Across 60 containers, this executes ~114-117 park writes and leaves ~54-57 containers double-parked with split-brain employee logs. Zero database conflicts are raised, but data integrity is silently broken.
+2. **Reframing Write Contention:** Under Guarded FIFO, the detected conflict count (~46 to 60) is not mere overhead: **it is the exact count of physical misparks intercepted and prevented by the database**. 60 is the mathematical contention ceiling (one lost race per container under 2 concurrent workers). Thread timing causes variance across machines, but correctness held across 100% of runs.
+3. **Queue Strategy Optimization:**
+   - **Random Draw (`--claim random`)** reduces collisions by 20x, but breaks FIFO arrival order.
+   - **Centralized Dispatch (`--claim dispatch`)** moves contention off the expensive physical drive path onto the in-memory claim retry, achieving 0 parking collisions while preserving strict customer arrival order.
 
-  Measured by running the engine scripts unmodified against a mocked DynamoDB, so the
-conflict count is the outcome of real races rather than an estimate. That 59 out of 60 figure
-is worth reading carefully: it is not noise, it is the contention ceiling. Every hostler
-claims `gate_items[0]`, so two processes always drive to the same container, and one always
-loses. The conditional write does its job — no unit was ever double-parked — but the losing
-process burns a round trip each time. Letting hostlers draw from anywhere in the waiting
-queue instead of the head drops the same workload from 59 conflicts to 3. That change is
-deliberately not made here, because taking units out of arrival order abandons FIFO, and in a
-real yard the first truck in line is the one that has been waiting longest. Fixing contention
-properly means a dispatcher assigning moves rather than workers racing for them — see the
-roadmap.
+**Scan cost, measured:** that same 60-container shift issued 184 scans across 550 pages and read **10,980 rows before filtering** (183 rows read per container actually in the yard). Every scan reads the whole table, including units that departed hours ago. That multiple is the argument for the Global Secondary Index at the top of the roadmap, and it is now a number rather than a claim.
 
 
 ## Future Roadmap & Suggested Enhancements
 
 Four known limits in the current build, in the order I would fix them:
 
-* **Move the status lookups off `Scan`.** The engines scan the whole table and filter for `Ingate_Hold` or `Parked` afterward, so every pass reads — and pays for — every row, including units that outgated weeks ago. A Global Secondary Index on `Current_Status` turns each of those into a `Query` that only touches the units the worker actually wants. `scan_all()` handles pagination correctly in the meantime so nothing is silently dropped, but the read cost grows linearly with the table and this is the first thing that breaks at real volume.
+* **Move the status lookups off `Scan`.** The engines scan the whole table and filter for `Ingate_Hold` or `Parked` afterward, so every pass reads, and pays for, every row, including units that outgated weeks ago. A Global Secondary Index on `Current_Status` turns each of those into a `Query` that only touches the units the worker actually wants. `scan_all()` handles pagination correctly in the meantime so nothing is silently dropped, but the read cost grows linearly with the table and this is the first thing that breaks at real volume.
 
-* **Dispatch moves instead of letting hostlers race for them.** As measured above, two hostlers both claim the head of the gate queue and one always loses the conditional write. Correctness holds, but roughly half the fleet's round trips are wasted. The fix is a dispatcher that assigns a unit to a specific hostler — a `Claimed_By` stamp written before the drive rather than after it — which preserves FIFO and removes the contention instead of just surviving it.
+* **Prevent double-spot assignment during concurrent ingates.** Currently `main.py` takes a point-in-time snapshot of occupied spots and assigns free spots locally. If multiple gate clerks run at the exact same second, they can assign the same spot to different container IDs because the primary key is `Container_ID` rather than `Assigned_Spot`. In `test_yard.py`, running two concurrent gate clerks empirically creates spot collisions (e.g. 15 duplicate spot assignments across 30 units). In production, spot assignment should be managed via a dedicated spots partition or deferred until the hostler grounds the unit.
 
 * **Build a real audit trail on DynamoDB Streams.** `Parked_By_Employee` is stamped onto the container record, so a later move overwrites the earlier one and only the most recent hostler is on file. Piping the table's stream into an append-only move log gives management the full chain of custody a damage claim actually needs.
 

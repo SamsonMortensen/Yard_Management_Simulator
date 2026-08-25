@@ -42,7 +42,7 @@ with col3:
     st.metric("Units Holding at Gate", gate_hold)
 with col4:
     if departed.empty:
-        st.metric("Avg Dwell of Departed Units", "—")
+        st.metric("Avg Dwell of Departed Units", "N/A")
     else:
         avg_dwell = departed['Dwell_Time_Hours'].astype(float).mean()
         st.metric("Avg Dwell of Departed Units", f"{avg_dwell:.2f} hrs")
@@ -58,7 +58,7 @@ else:
     arrivals = pd.to_datetime(in_yard['Arrival_Time'], utc=True)
     in_yard['Hours_In_Yard'] = ((now - arrivals).dt.total_seconds() / 3600).round(2)
 
-    # Reorder the columns (Parked_By_Employee stays internal — audit data, not public view)
+    # Reorder the columns (Parked_By_Employee stays internal: audit data, not public view)
     in_yard = in_yard[['Container_ID', 'Assigned_Spot', 'Equipment_Type',
                        'Current_Status', 'Arrival_Time', 'Hours_In_Yard']]
     st.dataframe(in_yard, use_container_width=True, hide_index=True)

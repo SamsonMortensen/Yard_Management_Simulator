@@ -64,7 +64,7 @@ def run_shift():
                 break # Clock out if the yard is empty
             time.sleep(4) # break before the next truck arrives
     except KeyboardInterrupt:
-        print("\nShift ended early — outgate clocking out.")
+        print("\nShift ended early: outgate clocking out.")
 
 
 if __name__ == "__main__":
