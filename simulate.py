@@ -122,7 +122,8 @@ def run_shift(containers=60, hostlers=2, outgates=1, claim="head",
     items = table.all_items()
     statuses = {}
     for item in items:
-        statuses[item["Current_Status"]] = statuses.get(item["Current_Status"], 0) + 1
+        status = item.get("Current_Status", "Spot_Reservation")
+        statuses[status] = statuses.get(status, 0) + 1
 
     # Measure park updates and double-parks empirically for all modes
     park_attempts = after_parking["updates"] - after_ingate["updates"]

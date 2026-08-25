@@ -100,6 +100,9 @@ Four known limits in the current build, in the order I would fix them:
 
 * **Move the status lookups off `Scan`.** The engines scan the whole table and filter for `Ingate_Hold` or `Parked` afterward, so every pass reads, and pays for, every row, including units that outgated weeks ago. A Global Secondary Index on `Current_Status` turns each of those into a `Query` that only touches the units the worker actually wants. `scan_all()` handles pagination correctly in the meantime so nothing is silently dropped, but the read cost grows linearly with the table and this is the first thing that breaks at real volume.
 
-* **Build a real audit trail on DynamoDB Streams.** `Parked_By_Employee` is stamped onto the container record, so a later move overwrites the earlier one and only the most recent hostler is on file. Piping the table's stream into an append-only move log gives management the full chain of custody a damage claim actually needs.
+* **Build a real audit trail on DynamoDB Streams.**
+
+### Note on Single-Table Design
+During development, introducing a second entity type (`SPOT#` reservations) into a single-table design silently broke every reader that assumed one shape (the dashboard, the simulator harness, and scan cursor pagination). This is a canonical DynamoDB single-table lesson: data access patterns must strictly filter by entity type (`Type` or prefix) otherwise heterogeneous records will corrupt metrics and scans. `Parked_By_Employee` is stamped onto the container record, so a later move overwrites the earlier one and only the most recent hostler is on file. Piping the table's stream into an append-only move log gives management the full chain of custody a damage claim actually needs.
 
 * **Add a TTL or archive step for departed units.** Outgated containers stay in the table forever. They no longer count against yard capacity, but they pad every scan and every read.

@@ -311,8 +311,8 @@ class MockTable:
             if ExclusiveStartKey is not None:
                 # Accept a dict or raw key
                 cursor = ExclusiveStartKey.get(self.key_name) if isinstance(ExclusiveStartKey, dict) else ExclusiveStartKey
-                if cursor in all_keys:
-                    start_index = all_keys.index(cursor) + 1
+                import bisect
+                start_index = bisect.bisect_right(all_keys, cursor)
 
             page_keys = all_keys[start_index:start_index + limit]
             self.stats["items_read_by_scans"] += len(page_keys)

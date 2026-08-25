@@ -20,6 +20,7 @@ if st.button("Refresh"):
     load_data.clear()
 
 df = load_data()
+df = df[~df['Container_ID'].str.startswith('SPOT#')]
 
 if df.empty:
     st.info("The yard is currently empty. Run main.py to generate traffic.")

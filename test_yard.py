@@ -342,21 +342,21 @@ def test_concurrent_gate_clerks_spot_collision():
     import threading, sys, os
 
     def run_clerk():
-        old_stdout = sys.stdout
-        sys.stdout = open(os.devnull, 'w')
-        try:
-            ingate_engine.push_to_cloud(15)
-        finally:
-            sys.stdout.close()
-            sys.stdout = old_stdout
+        ingate_engine.push_to_cloud(15)
 
+    old_stdout = sys.stdout
+    sys.stdout = open(os.devnull, 'w')
+    
     t1 = threading.Thread(target=run_clerk)
     t2 = threading.Thread(target=run_clerk)
-    
-    t1.start()
-    t2.start()
-    t1.join()
-    t2.join()
+    try:
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+    finally:
+        sys.stdout.close()
+        sys.stdout = old_stdout
 
     items = [i for i in table.all_items() if not i.get("Container_ID", "").startswith("SPOT#")]
     spots = [i["Assigned_Spot"] for i in items]
