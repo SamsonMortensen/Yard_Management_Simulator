@@ -62,7 +62,7 @@ python test_yard.py                            # 48 unit and integration tests
 
 **Optimistic concurrency.** Multiple hostler and outgate processes poll the same table, so two workers can target the same container. Every state transition uses a DynamoDB conditional write (`ConditionExpression` on the current status): the transition is atomic, exactly one writer succeeds, and the loser catches `ConditionalCheckFailedException` and rescans. No locks, no coordinator process.
 
-**Scan vs. Query.** The engines poll with `Scan` + `FilterExpression`, which reads the entire table and filters afterward (fine at demo scale, but read cost grows linearly with table size). The production design is a Global Secondary Index keyed on `Current_Status`, letting each engine `Query` only the items in the state it cares about. The scans are kept here to keep the demo to a single table; the GSI refactor is on the roadmap.
+**Scan vs. Query.** The engines poll with `Scan` + `FilterExpression`, which reads the entire table and filters afterward (fine at demo scale, but read cost grows quadratically with table size). The production design is a Global Secondary Index keyed on `Current_Status`, letting each engine `Query` only the items in the state it cares about. The scans are kept here to keep the demo to a single table; the GSI refactor is on the roadmap.
 
 **Pagination.** DynamoDB returns at most 1 MB per scan page. All scans go through a shared helper that follows `LastEvaluatedKey`, so results stay complete no matter how large the table grows.
 
@@ -98,7 +98,16 @@ State space guarantees across all runs for a 60-container shift with 2 hostlers 
 
 Four known limits in the current build, in the order I would fix them:
 
-* **Move the status lookups off `Scan`.** The engines scan the whole table and filter for `Ingate_Hold` or `Parked` afterward, so every pass reads, and pays for, every row, including units that outgated weeks ago. A Global Secondary Index on `Current_Status` turns each of those into a `Query` that only touches the units the worker actually wants. `scan_all()` handles pagination correctly in the meantime so nothing is silently dropped, but the read cost grows linearly with the table and this is the first thing that breaks at real volume.
+* **Move the status lookups off `Scan`.** The engines scan the whole table and filter for `Ingate_Hold` or `Parked` afterward, so every pass reads, and pays for, every row, including units that outgated weeks ago. **Scan is O(N²) in yard size; here is the measured curve; a GSI on Current_Status makes it O(matching rows).**
+
+  | Containers | Rows Read | Growth | Amplification (Rows/Container) |
+  | :--- | :--- | :--- | :--- |
+  | 100 | 61,250 | — | 612× |
+  | 200 | 244,900 | 4.00× | 1,224× |
+  | 400 | 940,200 | 3.84× | 2,350× |
+  | 1,347 (Full PANYNJ) | 11,247,450 | ~12.0× | 8,350× |
+
+  *Note: Ingesting real PANYNJ container volume (1,347 units) wasn't just decoration — it's what made the scaling limit observable and measurable. At real port volume, the O(N²) scan cost is a wall you can measure.* `scan_all()` handles pagination correctly in the meantime so nothing is silently dropped, but the read cost grows quadratically with the table size and this is the first thing that breaks at real volume.
 
 * **Build a real audit trail on DynamoDB Streams.**
 

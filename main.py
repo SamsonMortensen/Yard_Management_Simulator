@@ -37,10 +37,20 @@ def generate_arrival(assigned_spot):
         'Arrival_Time': datetime.now(timezone.utc).isoformat(),
     }
 
-def push_to_cloud(num_containers):
+def push_to_cloud(num_containers, data_file=None):
     print(f"Generating {num_containers} new arrivals at the gate...")
 
-    for _ in range(num_containers):
+    manifest = None
+    if data_file:
+        import csv
+        with open(data_file, "r", encoding="utf-8") as f:
+            manifest = list(csv.DictReader(f))
+        if num_containers > 0 and len(manifest) > num_containers:
+            manifest = manifest[:num_containers]
+        elif num_containers == 0:
+            num_containers = len(manifest)
+
+    for i in range(num_containers if manifest is None else len(manifest)):
         while True:
             occupied_spots = get_occupied_spots()
             free_spots = set(range(config.MIN_SPOT, config.MAX_SPOT + 1)) - occupied_spots
@@ -60,7 +70,17 @@ def push_to_cloud(num_containers):
                     continue
                 raise
             
-            new_container = generate_arrival(assigned_spot)
+            if manifest:
+                row = manifest[i]
+                new_container = {
+                    'Container_ID': row['Container_ID'],
+                    'Equipment_Type': row['Equipment_Type'],
+                    'Current_Status': 'Ingate_Hold',
+                    'Assigned_Spot': assigned_spot,
+                    'Arrival_Time': row.get('Arrival_Time')
+                }
+            else:
+                new_container = generate_arrival(assigned_spot)
             
             try:
                 table.put_item(

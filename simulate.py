@@ -51,7 +51,7 @@ def _restore_time():
 # Scenario ----------------------------------------------------------------
 
 def run_shift(containers=60, hostlers=2, outgates=1, claim="head",
-              unsafe=False, speed=0.01, page_size=25, seed=42, verbose=False):
+              unsafe=False, speed=0.01, page_size=25, seed=42, verbose=False, data_file=None):
     """Ingate, park, then outgate a full shift. Returns the measurements."""
     random.seed(seed)
     os.environ["YMS_CLAIM"] = claim
@@ -72,7 +72,7 @@ def run_shift(containers=60, hostlers=2, outgates=1, claim="head",
     def _run_all():
         started = time.perf_counter()
 
-        ingate_engine.push_to_cloud(containers)
+        ingate_engine.push_to_cloud(containers, data_file=data_file)
         snapshot_ingate = dict(table.stats)
 
         # Concurrent hostlers: contention / collisions occur here
@@ -103,7 +103,7 @@ def run_shift(containers=60, hostlers=2, outgates=1, claim="head",
 
         # TAS checks on departed & missing units (must be denied)
         departed = [i["Container_ID"] for i in table.all_items()
-                    if i["Current_Status"] == "Departed"]
+                    if i.get("Current_Status") == "Departed"]
         dry_run_attempts = departed[:12] + ["FAKE9999999"]
         denied_count = sum(0 if dispatch_check.check_appointment(cid) else 1
                            for cid in dry_run_attempts)
@@ -313,6 +313,7 @@ def main():
         description="Run a yard shift against the in-memory table. No AWS required."
     )
     parser.add_argument("--containers", type=int, default=60)
+    parser.add_argument("--data-file", type=str, default=None, help="Path to historical_manifest.csv")
     parser.add_argument("--hostlers", type=int, default=2)
     parser.add_argument("--outgates", type=int, default=1)
     parser.add_argument("--claim", choices=("head", "random", "dispatch"), default="head",
@@ -385,7 +386,7 @@ def main():
     result = run_shift(
         containers=args.containers, hostlers=args.hostlers, outgates=args.outgates,
         claim=args.claim, unsafe=args.unsafe, speed=args.speed, page_size=args.page_size,
-        seed=args.seed, verbose=args.verbose,
+        seed=args.seed, verbose=args.verbose, data_file=args.data_file,
     )
     print(render(result))
 
