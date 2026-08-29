@@ -1,117 +1,222 @@
-# Serverless Intermodal Yard Management System (YMS) Simulator
+# Intermodal Railyard Simulator
 
-## Overview
+A working model of an intermodal rail terminal: trains discharging on the track, cranes
+working double stack wells, hostlers moving units around the yard, and outside drivers
+coming through the gate to drop off and pick up.
 
-This event-driven, microservice-based setup simulates real-time intermodal logistics and yard operations. It replicates the journey of freight containers through a transit facility from gate arrival to hostler parking, all the way to the final outgate, while tracking live operational metrics and ensuring data governance.
+I spent almost three years as an Intermodal Equipment Operator at BNSF Railway, at the
+Tukwila intermodal facility. The operational details here come from that, not from a
+textbook. The concurrency and database work is the part I built to learn cloud data
+engineering.
 
-## The Business Problem
+## The problem it models
 
-Supply chains often experience delays between actual yard movements and updates to enterprise databases, leading to issues such as dry runs, misparks, and inefficient capacity planning. Our project tackles this by leveraging cloud infrastructure and real-time data pipelines, giving dispatchers quick, actionable insights and securely logging employee actions.
+A yard runs on knowing where every unit is. When the database lags behind what is
+physically happening on the ground you get dry runs (a driver shows up for a box that
+is not available), misparks, and capacity numbers nobody trusts. Two workers going after
+the same container is not a rare edge case either, it happens constantly during a train
+offload.
 
-## Architecture & Tech Stack
+So the question this project answers is: if several workers are hitting the same table at
+once, what actually keeps the data correct, and what does it cost.
 
-* **Cloud Database:** AWS DynamoDB (NoSQL) for fast, key-value status updates.
-* **Simulation Engine:** Python (`boto3`) scripts that simulate gate clerks, yard hostlers, and outbound dispatchers.
-* **Analytics Front-End:** Streamlit & Pandas for live data visualization and KPI monitoring.
-
-## Core Features
-
-* **Live Ingestion Pipeline:** Creates random inbound container traffic and assigns numeric parking spots to keep things running smoothly.
-* **Automated State Changes:** Background processes update container statuses automatically (`Ingate_Hold` -> `Parked` -> `Departed`).
-* **Terminal Appointment System (TAS):** Smart business logic prevents "Dry Runs" by checking container availability before issuing gate codes.
-* **Internal Audit Trailing:** Logs unique employee IDs linked to yard movements in the cloud, keeping audit data separate from the public dispatch dashboard.
-* **Real-Time Analytics:** Continuously calculates and shows yard capacity usage and container dwell times.
-
-## Run it in two commands, with no AWS account
+## Run it
 
 ```bash
 pip install -r requirements.txt
 python simulate.py
 ```
 
-That runs a full shift: 60 containers ingated, parked by two concurrent hostlers, then outgated, against an in-memory DynamoDB stand-in (`mock_dynamo.py`), and prints the correctness checks, the write-contention count and the scan cost.
+No AWS account needed. That runs a full shift against an in-memory stand-in
+(`mock_dynamo.py`) and prints the correctness checks, the write contention count, and the
+read cost.
 
-The engines are **not modified** to make this work. `main.py`, `hostler.py`, `outgate.py` and `dispatch_check.py` run exactly as they would against real DynamoDB; `config.get_table()` simply hands them a different table object. Every conditional write, every retry and every filter is the real one. Only the simulated drive-time sleeps are compressed, via `--speed`.
-
-Useful flags:
+The engines are not modified to make this work. `main.py`, `crane.py`, `hostler.py`,
+`outgate.py` and `dispatch_check.py` run exactly as they would against real DynamoDB.
+`config.get_table()` just hands them a different table object. Every conditional write and
+every query is the real one. Only the simulated drive and lift times are compressed, with
+`--speed`.
 
 ```bash
-python simulate.py --compare                   # run side-by-side benchmark of control vs guarded modes
-python simulate.py --unsafe                    # run without conditional writes to prove failure mode
-python simulate.py --repeat 10                 # report distribution across 10 shift runs
-python simulate.py --claim dispatch            # run with centralized task assignment (0 conflicts + FIFO)
-python simulate.py --export-csv shift.csv      # dump shift telemetry to CSV for pandas analytics
-python test_yard.py                            # 48 unit and integration tests
+python simulate.py --unsafe               # same shift with the conditional writes removed
+python simulate.py --claim dispatch       # claim before driving instead of racing
+python simulate.py --cranes 2 --hostlers 4
+python simulate.py --verbose              # show the engines' own output
+python test_yard.py                       # 52 tests
 ```
 
-## How to Run Against Real AWS  
+## How a unit moves
 
-1. Clone the repo.
-2. Install dependencies with `pip install -r requirements.txt`.
-3. Set up your AWS CLI with the right IAM credentials (`aws configure`) for DynamoDB access.
-4. Create the table: `python setup_table.py`.
-5. Start the dashboard using `streamlit run app.py`.
-6. Run the engine scripts in separate terminals:
-   - `python main.py` drops units at the gate (pass a count, e.g. `python main.py 20`).
-   - `python hostler.py` works the gate queue until it's clear, then clocks out.
-   - `python outgate.py` pulls parked units off the ground until the yard is empty, then clocks out.
-7. Check a unit against the TAS with `python dispatch_check.py`. Grab a `Container_ID` off the dashboard roster when it asks.
+Two directions, and they are different jobs.
 
+**Import.** Comes in on a train, leaves on a truck.
 
-## Concurrency & Scaling Considerations
+```
+Trackside_Hold  ->  Buffer_Hold      ->  Parked  ->  Departed (Road)
+(on the railcar)    (crane set it         (hostler     (customer cleared
+                     on a chassis)         parked it)   the gate and took it)
+```
 
-**Optimistic concurrency.** Multiple hostler and outgate processes poll the same table, so two workers can target the same container. Every state transition uses a DynamoDB conditional write (`ConditionExpression` on the current status): the transition is atomic, exactly one writer succeeds, and the loser catches `ConditionalCheckFailedException` and rescans. No locks, no coordinator process.
+If a hostler already has a chassis backed in when the crane picks the box up, it goes to
+`Rendezvous_Wait` instead of `Buffer_Hold` and that hostler takes it straight off.
 
-**Scan vs. Query.** The engines poll with `Scan` + `FilterExpression`, which reads the entire table and filters afterward (fine at demo scale, but read cost grows quadratically with table size). The production design is a Global Secondary Index keyed on `Current_Status`, letting each engine `Query` only the items in the state it cares about. The scans are kept here to keep the demo to a single table; the GSI refactor is on the roadmap.
+**Export.** Comes in on a truck, leaves on a train.
 
-**Pagination.** DynamoDB returns at most 1 MB per scan page. All scans go through a shared helper that follows `LastEvaluatedKey`, so results stay complete no matter how large the table grows.
+```
+Ingate_Hold  ->  Parked  ->  Awaiting_Rail  ->  Loaded_Rail  ->  Departed (Rail)
+(driver         (hostler     (hostler took      (crane set      (train left)
+ dropped it)     parked it)   it trackside)      it in a well)
+```
 
+`Current_Status` stays `Departed` for both. Which way it left is a separate field,
+`Departure_Mode`. Splitting the terminal state in two would have broken eleven readers
+that filter on `Departed`, so it is one state with an attribute.
 
-## Measured Findings: Proving the Failure Mode
+**Stack order is enforced.** A double stack well holds a bottom and a top. The top comes
+off first on offloads, and the bottom goes in first on loading. Each unit carries
+`Railcar_ID`, `Well_Position` and `Blocked_By`, and the crane will not lift something that
+is still pinned under another box. A unit that is claimed but not yet lifted still blocks,
+because it is physically still sitting there.
 
-A concurrency design is only as credible as the failure it prevents. To prove that DynamoDB conditional writes are load-bearing, the simulator includes an uncoordinated control mode (`--unsafe`) that runs the identical 60-container shift with conditional writes removed.
+## What keeps it correct
 
-**Empirical Benchmark (reproduce with `python simulate.py --compare`):**
-State space guarantees across all runs for a 60-container shift with 2 hostlers and 1 outgate:
+Every state change is a conditional write. The hostler updating a unit to `Parked`
+requires that it is still `Ingate_Hold` when the write lands. If another hostler got there
+during the drive, the write is rejected and this one goes back and rescans. No locks and
+no coordinator process.
 
-| Operational Mode | FIFO Preserved? | Successful Park Writes | Duplicate Misparks | Conflicts Intercepted |
-| :--- | :---: | :---: | :---: | :---: |
-| **Unsafe Blind Writes (`--unsafe`)** | **Yes** | **> 60** (Expected: 60) | **> 0** | **0 (Blind Overwrite)** |
-| **Guarded FIFO (`--claim head`)** | **Yes** | **Exactly 60** | **Exactly 0** | **<= 60 (Misparks Prevented)** |
-| **Random Draw (`--claim random`)** | **No** | **Exactly 60** | **Exactly 0** | **< 60 (Reduced Contention)** |
-| **Centralized Dispatch (`--claim dispatch`)** | **Yes** | **Exactly 60** | **Exactly 0** | **0 (0 Conflicts)** |
+To show that this is actually doing something rather than just sounding good, there is a
+control mode. `--unsafe` runs the identical shift with the conditions removed:
 
-*For exact numeric distributions from a recorded run, see [benchmark.txt](benchmark.txt) (recorded on Python 3.14 / Windows).*
+| | Conditional writes on | Conditional writes off |
+| --- | :---: | :---: |
+| Containers double parked | 0 | many |
+| Park writes for N containers | exactly N | more than N |
+| Conflicts raised | one per lost race | 0, nothing detects them |
 
-### Analytical Breakdown:
+The unsafe run raises zero database errors and quietly corrupts the yard. That is the
+point. The conflict count in a normal run is not overhead, it is the number of misparks
+the database stopped.
 
-1. **The Unsafe Control Proves Causality:** Without conditional writes, both hostlers read the queue, drive simultaneously, and blindly overwrite container records. Across 60 containers, this executes more than 60 park writes and leaves multiple containers double-parked with split-brain employee logs. Zero database conflicts are raised, but data integrity is silently broken.
-2. **Reframing Write Contention:** Under Guarded FIFO, the detected conflict count is bounded by [0, 60] and is not mere overhead: **it is the exact count of physical misparks intercepted and prevented by the database**. 60 is the mathematical contention ceiling (one lost race per container under 2 concurrent workers). Thread timing causes variance across machines, but correctness holds across 100% of runs.
-3. **Queue Strategy Optimization:**
-   - **Random Draw (`--claim random`)** breaks FIFO arrival order but scales much better: FIFO conflicts scale with the container count (ceiling = N, one lost race per unit), while random-draw conflicts stay near-constant as N grows.
-   - **Centralized Dispatch (`--claim dispatch`)** moves contention off the expensive physical drive path onto the in-memory claim retry, achieving 0 parking collisions while preserving strict customer arrival order.
+**Three ways to pick the next unit**, and they trade off differently:
 
-**Scan cost, measured:** A filtered scan reads every row in the table and pays for every row, regardless of how many match. That is the entire argument for the Global Secondary Index at the top of the roadmap, and `test_scan_counts_rows_read_before_filtering` proves it deterministically by reading 40 rows to return exactly 1. Total shift scan counts are recorded alongside the benchmarking output in `benchmark.txt`.
+- `head` takes the front of the queue, so every worker goes after the same box and all but
+  one lose. Losers rescan and can lose again, so contention grows with crew size, not just
+  with volume. Measured: 60 containers with 2 hostlers gives about 2.5 lost races per
+  container, 200 containers with 6 hostlers gives about 8.
+- `random` draws from anywhere in the queue. Collisions mostly go away, and so does
+  arrival order.
+- `dispatch` claims the unit before driving to it. A lost race costs a retry instead of a
+  wasted trip, and arrival order is preserved. This is what a real dispatcher does.
 
+## Reads
 
-## Future Roadmap & Suggested Enhancements
+The engines query a `Current_Status` GSI (`StatusIndex`) through `config.query_status()`,
+so a hostler looking for gate units reads only the gate units.
 
-Four known limits in the current build, in the order I would fix them:
+This was not the original design. It used to poll with `Scan` plus a filter, which reads
+every row in the table and charges for every row no matter how few match. The cost of that
+grows with the square of yard size, because the number of polls grows with the yard too:
 
-* **Move the status lookups off `Scan`.** The engines scan the whole table and filter for `Ingate_Hold` or `Parked` afterward, so every pass reads, and pays for, every row, including units that outgated weeks ago. **Scan is O(N²) in yard size; here is the measured curve; a GSI on Current_Status makes it O(matching rows).**
+| Containers | Rows read | Per container |
+| ---: | ---: | ---: |
+| 100 | 61,250 | 612x |
+| 200 | 244,900 | 1,224x |
+| 400 | 940,200 | 2,350x |
 
-  | Containers | Rows Read | Growth | Amplification (Rows/Container) |
-  | :--- | :--- | :--- | :--- |
-  | 100 | 61,250 | — | 612× |
-  | 200 | 244,900 | 4.00× | 1,224× |
-  | 400 | 940,200 | 3.84× | 2,350× |
-  | 1,347 (Full PANYNJ) | 11,247,450 | ~12.0× | 8,350× |
+Four times the rows for twice the containers, measured. Loading a real day of PANYNJ
+volume is what made that visible. At demo scale it looks fine.
 
-  *Note: Ingesting real PANYNJ container volume (1,347 units) wasn't just decoration — it's what made the scaling limit observable and measurable. At real port volume, the O(N²) scan cost is a wall you can measure.* `scan_all()` handles pagination correctly in the meantime so nothing is silently dropped, but the read cost grows quadratically with the table size and this is the first thing that breaks at real volume.
+## Demand forecasting
 
-* **Build a real audit trail on DynamoDB Streams.**
+`demand_forecast.py` works on real monthly TEU volume for nine US container ports (BTS
+dataset `iahn-a7j4`, 2020 to 2023), including NY/NJ.
 
-### Note on Single-Table Design
-During development, introducing a second entity type (`SPOT#` reservations) into a single-table design silently broke every reader that assumed one shape (the dashboard, the simulator harness, and scan cursor pagination). This is a canonical DynamoDB single-table lesson: data access patterns must strictly filter by entity type (`Type` or prefix) otherwise heterogeneous records will corrupt metrics and scans. `Parked_By_Employee` is stamped onto the container record, so a later move overwrites the earlier one and only the most recent hostler is on file. Piping the table's stream into an append-only move log gives management the full chain of custody a damage claim actually needs.
+44 months for one port is not enough to train on, so the model pools all nine ports and
+learns the shape rather than the level. That comparison is the result:
 
-* **Add a TTL or archive step for departed units.** Outgated containers stay in the table forever. They no longer count against yard capacity, but they pad every scan and every read.
+| Model | MAPE | vs naive |
+| :--- | ---: | ---: |
+| naive seasonal (same month last year) | 22.3% | baseline |
+| ridge, one port only | 11.7% | +48% |
+| ridge, pooled across ports | 8.9% | +60% |
+| gradient boosting, pooled | 6.2% | +72% |
+
+Pooling beats the single port model by 24% on identical folds, same algorithm. Evaluation
+is rolling origin, one step ahead, never shuffled.
+
+Unsupervised passes on the same data: PCA finds one national demand factor explaining 60%
+of variance across the nine ports, peaking May 2022 and bottoming May 2020. KMeans on
+seasonal shape separates the West Coast ports from the East and Gulf group without being
+told where any of them are.
+
+Classical seasonal decomposition is also in here as a comparison, and it is a useful one.
+On the stable 2000 to 2015 PANYNJ series it holds 4.1% MAPE against a held out six months,
+beating a naive seasonal baseline at 8.6%. On the 2020 to 2023 COVID window it goes to
+36.4% and loses to the naive baseline, because a straight line trend cannot represent the
+import surge and the destocking crash after it. Newer data is not automatically better
+data.
+
+## What is in the repo
+
+| File | What it does |
+| :--- | :--- |
+| `main.py` | Arrivals, spot assignment, SPOT# reservation |
+| `crane.py` | Unloading and loading, stack precedence, sweep strategy |
+| `hostler.py` | Yard moves both directions, dual cycling |
+| `outgate.py` | Road departures for imports |
+| `train.py` | Outbound train, well capacity, cutoff, departure |
+| `dispatch_check.py` | Gate authorization check |
+| `config.py` | Settings, GSI query helper, scan helper |
+| `mock_dynamo.py` | In-memory DynamoDB stand-in, so this runs with no account |
+| `simulate.py` | Runs a shift, collects telemetry, checks invariants |
+| `test_yard.py` | 52 tests |
+| `build_manifest.py` | Builds a day's manifest from real port volume |
+| `demand_forecast.py` | Supervised and unsupervised models on BTS port data |
+| `contention_analysis.py` | Does queue depth or yard occupancy drive contention |
+| `benchmark_sweep.py` | Crane sweep strategy comparison on a simulated clock |
+| `app.py` | Streamlit dashboard |
+
+## What this does not model
+
+Worth being straight about the edges.
+
+- Chassis are unlimited. At Tukwila we usually had hundreds of bare chassis staged, so
+  they were not the constraint, but a terminal that runs short of them behaves very
+  differently.
+- Containers are one per spot. No multi tier stacking, so no dig penalty when the box
+  somebody wants is buried under two others.
+- Ground crew removing cone locks is a fixed delay, not a crew with limited capacity.
+- No hazmat segregation, no reefer plug in tracking, no bad order or M&R track.
+- Weight distribution and destination blocking on the outbound train are not enforced.
+
+One known gap in the harness itself. The exactly once check miscounts when the yard is
+seeded with starting inventory, because the expected write count is derived per container
+arrival and does not account for units already on the ground. A seeded run reports failure
+when nothing is actually wrong. Replacing it with a per container duplicate transition
+check fixes it, and stops the count going stale every time the state machine gains a state.
+
+One thing that is not a gap, just slow: `contention_analysis.py` needs 15 to 20 minutes for
+a full pass. Three claim strategies, each running 200 containers against 800 seeded units
+at speed 0.05. It is not stalled. The seeded inventory and the slow clock are both load
+bearing, so shortening the run costs you the result.
+
+## Next
+
+1. Multi tier stacking with the dig penalty, and stacking by predicted dwell so the
+   forecasting work actually feeds an operational decision.
+2. Outbound train constraints that bind. Well capacity is currently sized to fit
+   everything, so nothing ever misses a cutoff, and missing the cutoff is the pressure
+   that makes export interesting.
+3. An append only move log on DynamoDB Streams. `Parked_By_Employee` is stamped on the
+   container record, so a later move overwrites the earlier one and only the most recent
+   operator is on file. A damage claim needs the whole chain.
+
+### Note on single table design
+
+Adding a second record type (`SPOT#` reservations) to the table silently broke every
+reader that assumed one shape: the dashboard counted spot locks as containers, the harness
+raised a KeyError on records with no status, and scan pagination reset when a cursor row
+was deleted mid scan. Nothing errored. The numbers were just wrong. If you put more than
+one entity type in a table, every read has to filter by type, and the failure mode when you
+forget is silence.

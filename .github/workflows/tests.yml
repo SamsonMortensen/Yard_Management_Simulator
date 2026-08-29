@@ -45,5 +45,11 @@ jobs:
       - name: Full shift, random claim strategy
         run: python simulate.py --containers 40 --hostlers 3 --speed 0 --claim random
 
-      - name: Repeated shifts hold correctness every run
-        run: python simulate.py --containers 30 --hostlers 3 --speed 0 --repeat 5
+      - name: Full shift, centralized dispatch
+        run: python simulate.py --containers 40 --hostlers 3 --speed 0 --claim dispatch
+
+      # Rail arrivals go through the crane, stack precedence and the buffer, which
+      # the single-crane default barely exercises. Two cranes and four hostlers put
+      # both flows under load at once.
+      - name: Dual flow under load, rail and gate together
+        run: python simulate.py --containers 60 --cranes 2 --hostlers 4 --speed 0

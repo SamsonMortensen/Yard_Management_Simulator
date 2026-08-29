@@ -208,3 +208,11 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Simulator run outputs. Regenerated on every run, so they are noise in a diff.
+occupancy_*.csv
+*_out.txt
+
+# Deliberately NOT ignored:
+#   historical_manifest.csv  pins the exact dataset the README numbers came from
+#   benchmark.txt            a recorded run, kept as a dated record rather than regenerated

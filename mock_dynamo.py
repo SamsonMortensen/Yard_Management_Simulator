@@ -155,7 +155,8 @@ def matches(item, condition):
     if operator == "contains":
         return _resolve(item, values[1]) in actual
     if operator == "IN":
-        return actual in [_resolve(item, v) for v in values[1:]]
+        # values[1] is the list passed to .is_in()
+        return actual in values[1]
 
     return False
 
@@ -215,6 +216,9 @@ class MockTable:
             "scans": 0,
             "scan_pages": 0,
             "items_read_by_scans": 0,
+            "queries": 0,
+            "query_pages": 0,
+            "items_read_by_queries": 0,
         }
 
     def clear(self):
@@ -333,6 +337,54 @@ class MockTable:
                 result["LastEvaluatedKey"] = {self.key_name: page_keys[-1]}
             return result
 
+
+    def query(self, IndexName=None, KeyConditionExpression=None, FilterExpression=None, Limit=None, ExclusiveStartKey=None):
+        limit = Limit or self.page_size
+        
+        with self._lock:
+            if ExclusiveStartKey is None:
+                self.stats["queries"] += 1
+            self.stats["query_pages"] += 1
+
+            # Determine matching items for the GSI partition key
+            all_matching = []
+            if IndexName == 'StatusIndex' and KeyConditionExpression:
+                # Naive in-memory filter matching KeyConditionExpression exactly
+                for item in self._items.values():
+                    if matches(item, KeyConditionExpression):
+                        all_matching.append(item)
+            else:
+                raise NotImplementedError("mock_dynamo only supports querying StatusIndex with KeyConditionExpression")
+            
+            # Sort by primary key for deterministic pagination
+            all_matching.sort(key=lambda x: x[self.key_name])
+            
+            start_index = 0
+            if ExclusiveStartKey is not None:
+                cursor = ExclusiveStartKey.get(self.key_name) if isinstance(ExclusiveStartKey, dict) else ExclusiveStartKey
+                for i, item in enumerate(all_matching):
+                    if item[self.key_name] > cursor:
+                        start_index = i
+                        break
+                else:
+                    start_index = len(all_matching)
+
+            page_items = all_matching[start_index:start_index + limit]
+            
+            # Here is the magic of the GSI: it only reads exactly what matched the partition key!
+            self.stats["items_read_by_queries"] += len(page_items)
+
+            # Apply FilterExpression if any (post-filtering on the matched partition)
+            final_items = []
+            from copy import deepcopy
+            for item in page_items:
+                if FilterExpression is None or matches(item, FilterExpression):
+                    final_items.append(deepcopy(item))
+
+            result = {"Items": final_items, "Count": len(final_items)}
+            if start_index + limit < len(all_matching):
+                result["LastEvaluatedKey"] = {self.key_name: page_items[-1][self.key_name]}
+            return result
 
 # Singleton instance shared by the engines during simulate.py
 _SHARED = MockTable()

@@ -11,7 +11,17 @@ def create_yard_table():
         client.create_table(
             TableName=TABLE_NAME,
             KeySchema=[{'AttributeName': 'Container_ID', 'KeyType': 'HASH'}],
-            AttributeDefinitions=[{'AttributeName': 'Container_ID', 'AttributeType': 'S'}],
+            AttributeDefinitions=[
+                {'AttributeName': 'Container_ID', 'AttributeType': 'S'},
+                {'AttributeName': 'Current_Status', 'AttributeType': 'S'}
+            ],
+            GlobalSecondaryIndexes=[
+                {
+                    'IndexName': 'StatusIndex',
+                    'KeySchema': [{'AttributeName': 'Current_Status', 'KeyType': 'HASH'}],
+                    'Projection': {'ProjectionType': 'ALL'}
+                }
+            ],
             BillingMode='PAY_PER_REQUEST'
         )
     except ClientError as e:

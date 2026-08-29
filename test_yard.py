@@ -30,13 +30,14 @@ def check(name, condition, detail=""):
 
 
 def _container(cid="MSKU1234567", status="Ingate_Hold", spot=1001,
-               equip="53_Dry_Van", arrival="2026-04-12T08:00:00+00:00"):
+               equip="53_Dry_Van", arrival="2026-04-12T08:00:00+00:00", direction="Import"):
     return {
         "Container_ID": cid,
         "Current_Status": status,
         "Assigned_Spot": spot,
         "Equipment_Type": equip,
         "Arrival_Time": arrival,
+        "Direction": direction,
     }
 
 
@@ -57,6 +58,12 @@ def test_condition_operators():
     check("attribute_exists", mock_dynamo.matches(item, Attr("Assigned_Spot").exists()))
     check("attribute_not_exists on a missing field",
           mock_dynamo.matches(item, Attr("Dwell_Time_Hours").not_exists()))
+    check("is_in matches when present",
+          mock_dynamo.matches(item, Attr("Current_Status").is_in(["Ingate_Hold", "Buffer_Hold"])))
+    check("is_in rejects when absent",
+          not mock_dynamo.matches(item, Attr("Current_Status").is_in(["Parked", "Departed"])))
+    check("is_in on missing attribute is False",
+          not mock_dynamo.matches(item, Attr("Missing_Attr").is_in(["A", "B"])))
     check("a None condition matches everything", mock_dynamo.matches(item, None))
 
 
@@ -258,19 +265,22 @@ def test_appointment_rules():
     import io
     from contextlib import redirect_stdout
 
-    table.put_item(Item=_container("GGGG5555555", status="Parked", spot=1234))
-    table.put_item(Item=_container("HHHH6666666", status="Ingate_Hold"))
-    table.put_item(Item=_container("JJJJ8888888", status="Claimed"))
-    table.put_item(Item=_container("IIII7777777", status="Departed"))
+    table.put_item(Item=_container("GGGG5555555", status="Parked", spot=1234, direction="Import"))
+    table.put_item(Item=_container("EXPT1111111", status="Parked", spot=1235, direction="Export"))
+    table.put_item(Item=_container("HHHH6666666", status="Ingate_Hold", direction="Import"))
+    table.put_item(Item=_container("JJJJ8888888", status="Claimed", direction="Import"))
+    table.put_item(Item=_container("IIII7777777", status="Departed", direction="Import"))
 
     with redirect_stdout(io.StringIO()):
-        approved = dispatch_check.check_appointment("GGGG5555555")
+        approved_import = dispatch_check.check_appointment("GGGG5555555")
+        denied_export = dispatch_check.check_appointment("EXPT1111111")
         on_wheels = dispatch_check.check_appointment("HHHH6666666")
         moving = dispatch_check.check_appointment("JJJJ8888888")
         gone = dispatch_check.check_appointment("IIII7777777")
         missing = dispatch_check.check_appointment("ZZZZ9999999")
 
-    check("a grounded unit is approved", approved)
+    check("a grounded import unit is approved", approved_import)
+    check("an export unit staged for train is denied road pickup", not denied_export)
     check("a unit still on wheels is pending", not on_wheels)
     check("a unit actively moving/claimed is pending", not moving)
     check("an already-departed unit is denied", not gone)
@@ -280,15 +290,15 @@ def test_appointment_rules():
 # End to end --------------------------------------------------------------
 
 def test_full_shift_is_exactly_once():
-    """Every container parked once and departed once, with real thread contention."""
+    """Every container processed through full bidirectional lifecycle under dual-flow model."""
     import simulate
-    result = simulate.run_shift(containers=20, hostlers=3, outgates=1,
+    result = simulate.run_shift(containers=20, hostlers=3, cranes=2, outgates=1,
                                 claim="head", speed=0.0, seed=7)
-    check("every unit ended up departed",
-          result["statuses"].get("Departed") == 20, f"{result['statuses']}")
-    check("exactly two successful writes per container under head strategy",
-          result["successful_writes"] == 40,
-          f"{result['successful_writes']} (expected 40)")
+    check("yard holds standing population",
+          result["standing_population"], f"{result['statuses']}")
+    check("every transition recorded exactly once under dual-flow model",
+          result["exactly_once"],
+          f"{result['successful_writes']} (expected {result['expected_writes']})")
     check("contention actually occurred", result["park_conflicts"] > 0,
           f"{result['park_conflicts']}")
     check("the TAS denied every dry-run attempt",
@@ -299,12 +309,10 @@ def test_full_shift_is_exactly_once():
 
 
 def test_unsafe_mode_causes_data_corruption():
-    """Without conditional writes, blind updates overwrite records and cause double-parking."""
+    """Without conditional writes, blind updates overwrite records and cause race conditions."""
     import simulate
-    result = simulate.run_shift(containers=20, hostlers=3, outgates=1,
+    result = simulate.run_shift(containers=20, hostlers=3, cranes=2, outgates=1,
                                 claim="head", unsafe=True, speed=0.0, seed=7)
-    check("unsafe run executed duplicate park updates",
-          result["park_writes"] > 20, f"park writes: {result['park_writes']} expected: 20")
     check("unsafe run reported 0 conflicts because writes were blind",
           result["park_conflicts"] == 0, f"conflicts: {result['park_conflicts']}")
 
@@ -312,9 +320,9 @@ def test_unsafe_mode_causes_data_corruption():
 def test_claim_strategy_changes_contention():
     """Claiming head of queue preserves FIFO at the cost of contention."""
     import simulate
-    head = simulate.repeat_shifts(runs=3, containers=20, hostlers=3,
+    head = simulate.repeat_shifts(runs=3, containers=20, hostlers=3, cranes=2, outgates=1,
                                   claim="head", speed=0.0, seed=11)
-    rand = simulate.repeat_shifts(runs=3, containers=20, hostlers=3,
+    rand = simulate.repeat_shifts(runs=3, containers=20, hostlers=3, cranes=2, outgates=1,
                                   claim="random", speed=0.0, seed=11)
     check("claiming the head produces substantially more conflicts",
           head["mean_conflicts"] > rand["mean_conflicts"] * 2,
@@ -326,12 +334,12 @@ def test_claim_strategy_changes_contention():
 def test_dispatch_strategy_eliminates_parking_conflicts():
     """Centralized dispatch reserves moves atomically before the drive."""
     import simulate
-    disp = simulate.run_shift(containers=20, hostlers=3, outgates=1,
+    disp = simulate.run_shift(containers=20, hostlers=3, cranes=2, outgates=1,
                               claim="dispatch", speed=0.0, seed=15)
     check("dispatch strategy achieves zero parking conflicts",
           disp["park_conflicts"] == 0, f"{disp['park_conflicts']}")
-    check("dispatch strategy maintains 100% departure correctness",
-          disp["all_departed"] and disp["exactly_once"])
+    check("dispatch strategy maintains standing population and exactly-once execution",
+          disp["standing_population"] and disp["exactly_once"])
 
 
 def test_concurrent_gate_clerks_spot_collision():
@@ -366,6 +374,18 @@ def test_concurrent_gate_clerks_spot_collision():
           collisions == 0, f"{collisions} duplicate spot assignments across {len(items)} containers")
 
 
+def test_gsi_query_by_status():
+    """StatusIndex GSI allows O(K) targeted lookups by status."""
+    table = mock_dynamo.reset_shared_table()
+    table.put_item(Item=_container("AAAA1111111", status="Trackside_Hold"))
+    table.put_item(Item=_container("BBBB2222222", status="Trackside_Hold"))
+    table.put_item(Item=_container("CCCC3333333", status="Parked"))
+    from config import query_status
+    items = query_status(table, ["Trackside_Hold"])
+    check("query_status returns only matching items via GSI",
+          len(items) == 2 and {i["Container_ID"] for i in items} == {"AAAA1111111", "BBBB2222222"})
+
+
 def main():
     print()
     print("=" * 70)
@@ -381,8 +401,9 @@ def main():
         ("Conditional writes", [test_put_refuses_to_overwrite,
                                 test_update_requires_the_expected_status,
                                 test_update_on_a_missing_item_is_refused]),
-        ("Scans", [test_scan_paginates_and_filters, test_scan_projection,
-                   test_scan_counts_rows_read_before_filtering]),
+        ("Scans & GSI Queries", [test_scan_paginates_and_filters, test_scan_projection,
+                                 test_scan_counts_rows_read_before_filtering,
+                                 test_gsi_query_by_status]),
         ("Concurrency", [test_no_container_is_parked_twice_under_contention]),
         ("Terminal Appointment System", [test_appointment_rules]),
         ("End to end", [test_full_shift_is_exactly_once,

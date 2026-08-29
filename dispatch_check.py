@@ -1,3 +1,21 @@
+"""Terminal Appointment System. The authorization check at the in-gate.
+
+An outside driver cannot just pull in and take a box. They get checked
+against the yard first, and this is that check. It answers one question:
+is this unit actually on the ground and available to this driver right now.
+
+Denied for the cases that would waste the trip:
+
+  not in the yard        never arrived, or already gone. This is the dry run
+                         the whole thing exists to prevent.
+  still on the train     Trackside_Hold, Buffer_Hold, Rendezvous_Wait or
+                         Claimed. It is here but nobody can hand it over yet.
+  Direction is Export    it is staged for a train, not for a customer.
+  already departed       somebody already took it.
+  anything unrecognized  deny and send it to the tower rather than guess.
+
+Approved only for a Parked Import. On the ground, and waiting for pickup.
+"""
 from botocore.exceptions import ClientError
 
 from config import get_table
@@ -12,7 +30,7 @@ def check_appointment(container_id):
         # Query the exact container record
         response = table.get_item(Key={'Container_ID': container_id})
 
-        #Edge Case 1: Container is completely missing (The Dry Run)
+        # Edge Case 1: Container is completely missing (The Dry Run)
         if 'Item' not in response:
             print("Appointment Denied.")
             print("Reason: Container not found in yard inventory. Dry run prevented.\n")
@@ -21,26 +39,33 @@ def check_appointment(container_id):
         item = response['Item']
         status = item.get('Current_Status')
         spot = item.get('Assigned_Spot')
+        direction = item.get('Direction', 'Import')
 
-        #Edge Case 2: In yard, but not grounded (waiting on hostler)
-        if status in ('Ingate_Hold', 'Claimed'):
+        # Edge Case 2: Outbound export unit staged for train, not customer pickup
+        if direction == 'Export':
+            print("Appointment Denied.")
+            print("Reason: Unit is an outbound export container staged for rail, not customer road pickup.\n")
+            return False
+
+        # Edge Case 3: In yard, but not grounded / still holding
+        if status in ('Ingate_Hold', 'Claimed', 'Buffer_Hold', 'Rendezvous_Wait', 'Trackside_Hold', 'Awaiting_Rail'):
             print("Appointment Pending.")
             print("Reason: Unit is at the facility but still on wheels/holding. Driver must wait.\n")
             return False
 
-        # Handle: Ready for pickup
+        # Handle: Ready for customer pickup
         elif status == 'Parked':
             print("Appointment Approved.")
             print(f"Gate code generated. Proceed to spot {spot}.\n")
             return True
 
-        #Edge Case 3: Already gone
+        # Edge Case 4: Already departed
         elif status == 'Departed':
             print("Appointment Denied.")
             print("Reason: Container has already outgated from the facility.\n")
             return False
 
-        #Edge Case 4: Status we don't recognize: deny rather than guess
+        # Edge Case 5: Unrecognized status: deny rather than guess
         print("Appointment Denied.")
         print(f"Reason: Unit is in an unrecognized status ({status}). Escalate to the tower.\n")
         return False
@@ -50,14 +75,14 @@ def check_appointment(container_id):
         return False
 
 
-#Run the Terminal Appointment System
+# Run the Terminal Appointment System
 if __name__ == "__main__":
     print("\n--- Terminal Appointment System (TAS) Online ---\n")
 
-    #Test 1: Simulate a driver asking for a container that isn't there
+    # Test 1: Simulate a driver asking for a container that isn't there
     check_appointment("FAKE9999999")
 
-    #Test 2: Interactive check
+    # Test 2: Interactive check
     print("To test a real unit, look at your Streamlit Dashboard's 'Active Roster'.")
     test_id = input("Enter a Container_ID from your screen (or press Enter to quit): ")
 
