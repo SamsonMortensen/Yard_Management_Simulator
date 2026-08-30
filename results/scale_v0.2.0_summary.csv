@@ -1,0 +1,13 @@
+containers,strategy,runs,all_correct,mean_wall_seconds,mean_conflicts,hops_per_unit,rehandles_per_100,mean_rollovers,mean_units_per_labor_hour
+100,adaptive,5,true,1.48,54.4,29.22,16.00,2.2,4.05
+100,dispatch,5,true,1.17,10.2,22.37,10.20,7.4,4.45
+100,head,5,true,1.04,216.4,30.48,5.40,4.0,3.89
+100,random,5,true,1.00,36.8,39.43,6.80,1.8,3.57
+200,adaptive,5,true,5.47,104.6,30.93,18.30,28.8,3.97
+200,dispatch,5,true,2.70,13.2,21.68,9.20,48.2,4.56
+200,head,5,true,3.08,491.6,27.24,5.40,41.6,4.10
+200,random,5,true,2.42,67.4,41.92,6.50,30.4,3.49
+400,adaptive,1,true,12.10,951.0,28.59,22.00,126.0,4.12
+400,dispatch,1,true,9.46,986.0,28.15,18.00,121.0,4.16
+400,head,1,true,14.05,1827.0,44.64,21.50,120.0,3.17
+400,random,1,true,8.14,166.0,44.02,6.50,122.0,3.43

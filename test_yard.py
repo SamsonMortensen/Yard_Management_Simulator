@@ -7,6 +7,7 @@ Runs the test suite without an AWS account:
 """
 import os
 import threading
+from datetime import datetime, timedelta, timezone
 
 # Force memory backend for tests
 os.environ["YMS_BACKEND"] = "memory"
@@ -38,6 +39,7 @@ def _container(cid="MSKU1234567", status="Ingate_Hold", spot=1001,
         "Equipment_Type": equip,
         "Arrival_Time": arrival,
         "Direction": direction,
+        "Planned_Departure_Mode": "Rail" if direction == "Export" else "Road",
     }
 
 
@@ -272,15 +274,15 @@ def test_appointment_rules():
     table.put_item(Item=_container("IIII7777777", status="Departed", direction="Import"))
 
     with redirect_stdout(io.StringIO()):
-        approved_import = dispatch_check.check_appointment("GGGG5555555")
-        denied_export = dispatch_check.check_appointment("EXPT1111111")
+        approved_roadbound = dispatch_check.check_appointment("GGGG5555555")
+        denied_railbound = dispatch_check.check_appointment("EXPT1111111")
         on_wheels = dispatch_check.check_appointment("HHHH6666666")
         moving = dispatch_check.check_appointment("JJJJ8888888")
         gone = dispatch_check.check_appointment("IIII7777777")
         missing = dispatch_check.check_appointment("ZZZZ9999999")
 
-    check("a grounded import unit is approved", approved_import)
-    check("an export unit staged for train is denied road pickup", not denied_export)
+    check("a grounded roadbound unit is approved", approved_roadbound)
+    check("a railbound unit staged for train is denied road pickup", not denied_railbound)
     check("a unit still on wheels is pending", not on_wheels)
     check("a unit actively moving/claimed is pending", not moving)
     check("an already-departed unit is denied", not gone)
@@ -298,7 +300,7 @@ def test_full_shift_is_exactly_once():
           result["standing_population"], f"{result['statuses']}")
     check("every transition recorded exactly once under dual-flow model",
           result["exactly_once"],
-          f"{result['successful_writes']} (expected {result['expected_writes']})")
+          f"{result['lifecycle_audit']['problems']}")
     check("contention actually occurred", result["park_conflicts"] > 0,
           f"{result['park_conflicts']}")
     check("the TAS denied every dry-run attempt",
@@ -318,7 +320,7 @@ def test_unsafe_mode_causes_data_corruption():
 
 
 def test_claim_strategy_changes_contention():
-    """Claiming head of queue preserves FIFO at the cost of contention."""
+    """Claiming the same sorted queue head increases contention."""
     import simulate
     head = simulate.repeat_shifts(runs=3, containers=20, hostlers=3, cranes=2, outgates=1,
                                   claim="head", speed=0.0, seed=11)
@@ -332,7 +334,7 @@ def test_claim_strategy_changes_contention():
 
 
 def test_dispatch_strategy_eliminates_parking_conflicts():
-    """Centralized dispatch reserves moves atomically before the drive."""
+    """Arrival-sorted dispatch reserves moves atomically before the drive."""
     import simulate
     disp = simulate.run_shift(containers=20, hostlers=3, cranes=2, outgates=1,
                               claim="dispatch", speed=0.0, seed=15)
@@ -343,8 +345,7 @@ def test_dispatch_strategy_eliminates_parking_conflicts():
 
 
 def test_concurrent_gate_clerks_spot_collision():
-    """Empirically verifies that conditional spot reservation prevents duplicate
-    spot allocation under concurrent gate clerks."""
+    """Concurrent clerks must never create two live claims on one ground tier."""
     table = mock_dynamo.reset_shared_table()
     import main as ingate_engine
     import threading, sys, os
@@ -366,12 +367,219 @@ def test_concurrent_gate_clerks_spot_collision():
         sys.stdout.close()
         sys.stdout = old_stdout
 
-    items = [i for i in table.all_items() if not i.get("Container_ID", "").startswith("SPOT#")]
-    spots = [i["Assigned_Spot"] for i in items]
-    unique_spots = set(spots)
-    collisions = len(spots) - len(unique_spots)
-    check("conditional spot allocation strictly prevents collisions under concurrent clerks",
-          collisions == 0, f"{collisions} duplicate spot assignments across {len(items)} containers")
+    from yard_topology import is_reservation_id
+    all_items = table.all_items()
+    items = [i for i in all_items if not is_reservation_id(i.get("Container_ID", ""))]
+    live_reservations = {
+        i["Container_ID"] for i in all_items
+        if i.get("Type") == "Ground_Reservation"
+    }
+    claimed_reservations = {
+        i.get("Ground_Reservation_ID") for i in items
+        if i.get("Ground_Reservation_ID") and i.get("Current_Status") != "Departed"
+    }
+    tiers_valid = all(1 <= int(i.get("Ground_Tier", 1)) <= 3 for i in items)
+    check("conditional ground allocation prevents duplicate spot-tier claims",
+          claimed_reservations == live_reservations and tiers_valid,
+          f"containers={len(claimed_reservations)}, reservations={len(live_reservations)}")
+
+
+def test_stack_access_rehandles_blockers():
+    """Retrieving a buried unit moves its blocker and preserves both claims."""
+    from yard_topology import rehandle_for_access, reservation_id
+
+    table = mock_dynamo.reset_shared_table()
+    target = {
+        **_container("STACK000001", status="Claimed", spot=1500),
+        "Ground_Tier": 1,
+        "Ground_Reservation_ID": reservation_id(1500, 1),
+        "Target_Dwell_Hours": 4,
+    }
+    blocker = {
+        **_container("STACK000002", status="Parked", spot=1500),
+        "Ground_Tier": 2,
+        "Ground_Reservation_ID": reservation_id(1500, 2),
+        "Target_Dwell_Hours": 20,
+    }
+    for tier in (1, 2):
+        table.put_item(Item={
+            "Container_ID": reservation_id(1500, tier),
+            "Type": "Ground_Reservation",
+            "Assigned_Spot": 1500,
+            "Ground_Tier": tier,
+            "Yard_Block": 15,
+        })
+    table.put_item(Item=target)
+    table.put_item(Item=blocker)
+
+    movement = rehandle_for_access(table, target, "HOSTLER-TEST")
+    moved = table.get_item(Key={"Container_ID": blocker["Container_ID"]})["Item"]
+    reservation_ids = {
+        item["Container_ID"] for item in table.all_items()
+        if item.get("Type") == "Ground_Reservation"
+    }
+    check("a buried retrieval performs one physical rehandle", movement["rehandles"] == 1)
+    check("the blocker moves clear of the retrieval stack", moved["Assigned_Spot"] != 1500)
+    check("the rehandle exchanges ground claims atomically",
+          moved["Ground_Reservation_ID"] in reservation_ids
+          and reservation_id(1500, 2) not in reservation_ids)
+
+
+def test_claim_refreshes_a_rehandled_location():
+    """A claim must release the reservation created after its original queue scan."""
+    import hostler
+    from atomic_ops import relocate_ground_unit, transition_and_release
+    from yard_topology import reservation_id
+
+    table = mock_dynamo.reset_shared_table()
+    hostler.table = table
+    stale = {
+        **_container("MOVED000001", status="Parked", spot=1500, direction="Export"),
+        "Ground_Tier": 2,
+        "Ground_Reservation_ID": reservation_id(1500, 2),
+    }
+    table.put_item(Item={
+        "Container_ID": stale["Ground_Reservation_ID"],
+        "Type": "Ground_Reservation", "Assigned_Spot": 1500,
+        "Ground_Tier": 2, "Yard_Block": 15,
+    })
+    table.put_item(Item=stale)
+    new_location = {
+        "Assigned_Spot": 1600, "Ground_Tier": 1, "Yard_Block": 16,
+        "Ground_Reservation_ID": reservation_id(1600, 1),
+    }
+    relocate_ground_unit(table, stale, new_location, "HOSTLER-REHANDLE")
+
+    claimed = hostler._claim_candidate([stale], "HOSTLER-CLAIM", expected_status="Parked")
+    check("a claim rereads a blocker location changed after the queue scan",
+          claimed["Ground_Reservation_ID"] == new_location["Ground_Reservation_ID"])
+    transition_and_release(
+        table, claimed["Container_ID"], claimed["Assigned_Spot"],
+        "set Current_Status = :s", {':s': 'Awaiting_Rail'},
+        expected_status="Claimed", reservation_key=claimed["Ground_Reservation_ID"],
+    )
+    reservations = [
+        item for item in table.all_items() if item.get("Type") == "Ground_Reservation"
+    ]
+    check("the claimed move releases the refreshed ground reservation", not reservations)
+
+
+def test_stale_unclaimed_move_preserves_the_new_reservation():
+    """A racing retrieval cannot delete a reservation from its stale queue row."""
+    from atomic_ops import relocate_ground_unit, transition_and_release
+    from yard_topology import reservation_id
+
+    table = mock_dynamo.reset_shared_table()
+    stale = {
+        **_container("RACING00001", status="Parked", spot=1500, direction="Export"),
+        "Ground_Tier": 2,
+        "Ground_Reservation_ID": reservation_id(1500, 2),
+    }
+    table.put_item(Item={
+        "Container_ID": stale["Ground_Reservation_ID"],
+        "Type": "Ground_Reservation", "Assigned_Spot": 1500,
+        "Ground_Tier": 2, "Yard_Block": 15,
+    })
+    table.put_item(Item=stale)
+    new_location = {
+        "Assigned_Spot": 1600, "Ground_Tier": 1, "Yard_Block": 16,
+        "Ground_Reservation_ID": reservation_id(1600, 1),
+    }
+    relocate_ground_unit(table, stale, new_location, "HOSTLER-REHANDLE")
+
+    refused = False
+    try:
+        transition_and_release(
+            table, stale["Container_ID"], stale["Assigned_Spot"],
+            "set Current_Status = :s", {':s': 'Awaiting_Rail'},
+            expected_status="Parked",
+            reservation_key=stale["Ground_Reservation_ID"],
+            expected_reservation=stale["Ground_Reservation_ID"],
+        )
+    except ClientError:
+        refused = True
+    current = table.get_item(Key={"Container_ID": stale["Container_ID"]})["Item"]
+    reservations = {
+        item["Container_ID"] for item in table.all_items()
+        if item.get("Type") == "Ground_Reservation"
+    }
+    check("a stale unclaimed retrieval is rejected", refused)
+    check("the relocated unit keeps its authoritative reservation",
+          current["Current_Status"] == "Parked"
+          and new_location["Ground_Reservation_ID"] in reservations)
+
+
+def test_stale_rehandle_cannot_leave_two_reservations():
+    """Two crews relocating one blocker must not create two live ground claims."""
+    from atomic_ops import relocate_ground_unit
+    from yard_topology import reservation_id
+
+    table = mock_dynamo.reset_shared_table()
+    blocker = {
+        **_container("BLOCKER0001", status="Parked", spot=1500),
+        "Ground_Tier": 2,
+        "Ground_Reservation_ID": reservation_id(1500, 2),
+    }
+    table.put_item(Item={
+        "Container_ID": blocker["Ground_Reservation_ID"],
+        "Type": "Ground_Reservation", "Assigned_Spot": 1500,
+        "Ground_Tier": 2, "Yard_Block": 15,
+    })
+    table.put_item(Item=blocker)
+    first = {
+        "Assigned_Spot": 1600, "Ground_Tier": 1, "Yard_Block": 16,
+        "Ground_Reservation_ID": reservation_id(1600, 1),
+    }
+    second = {
+        "Assigned_Spot": 1700, "Ground_Tier": 1, "Yard_Block": 17,
+        "Ground_Reservation_ID": reservation_id(1700, 1),
+    }
+    relocate_ground_unit(table, blocker, first, "CREW-ONE")
+    refused = False
+    try:
+        relocate_ground_unit(table, blocker, second, "CREW-TWO")
+    except ClientError:
+        refused = True
+    reservations = [
+        item for item in table.all_items() if item.get("Type") == "Ground_Reservation"
+    ]
+    current = table.get_item(Key={"Container_ID": blocker["Container_ID"]})["Item"]
+    check("a second crew cannot relocate a blocker from a stale location", refused)
+    check("one blocker retains exactly one authoritative ground reservation",
+          len(reservations) == 1
+          and reservations[0]["Container_ID"] == first["Ground_Reservation_ID"]
+          and current["Ground_Reservation_ID"] == first["Ground_Reservation_ID"])
+
+
+def test_train_enforces_physical_loading_rules():
+    """Well length, stack foundation, weight, and destination govern loading."""
+    from train import OutboundTrain
+
+    train = OutboundTrain(well_capacity=2, cutoff_minutes=60, well_lengths=[40, 53])
+    cars = list(train.wells)
+    ok_53_in_40, _ = train.can_load(
+        cars[0], "Bottom", "LONG0000001", equipment_type="53_Dry_Van"
+    )
+    overweight, _ = train.can_load(
+        cars[1], "Bottom", "HEAVY000001", equipment_type="40_High_Cube",
+        gross_weight_lbs=70_000,
+    )
+    train.load_container(
+        cars[1], "Bottom", "BASE0000001", equipment_type="40_High_Cube",
+        gross_weight_lbs=45_000, destination_block="BLOCK_A",
+    )
+    wrong_destination, _ = train.can_load(
+        cars[1], "Top", "DEST0000001", equipment_type="40_High_Cube",
+        gross_weight_lbs=40_000, destination_block="BLOCK_B",
+    )
+    valid_top, _ = train.can_load(
+        cars[1], "Top", "TOP00000001", equipment_type="40_High_Cube",
+        gross_weight_lbs=40_000, destination_block="BLOCK_A",
+    )
+    check("53-foot equipment is rejected by a 40-foot well", not ok_53_in_40)
+    check("a container above the single-unit weight limit is rejected", not overweight)
+    check("one well cannot mix destination blocks", not wrong_destination)
+    check("a compatible top load is accepted over its foundation", valid_top)
 
 
 def test_gsi_query_by_status():
@@ -384,6 +592,123 @@ def test_gsi_query_by_status():
     items = query_status(table, ["Trackside_Hold"])
     check("query_status returns only matching items via GSI",
           len(items) == 2 and {i["Container_ID"] for i in items} == {"AAAA1111111", "BBBB2222222"})
+
+
+def test_inbound_bottom_references_actual_top_container():
+    table = mock_dynamo.reset_shared_table()
+    import main as ingate_engine
+    ingate_engine.table = table
+    ingate_engine.push_to_cloud(4)
+    rail = [item for item in table.all_items() if item.get("Arrival_Mode") == "Rail"]
+    top = next(item for item in rail if item["Well_Position"] == "Top")
+    bottom = next(item for item in rail if item["Well_Position"] == "Bottom")
+    check("a bottom unit is blocked by the actual top container ID",
+          bottom["Blocked_By"] == top["Container_ID"], bottom["Blocked_By"])
+
+
+def test_train_cutoff_and_atomic_departure():
+    import train
+    train.reset_trains()
+    table = mock_dynamo.reset_shared_table()
+    consist = train.get_outbound_train("TEST-TRAIN", well_capacity=1, cutoff_minutes=60)
+    for cid, pos in (("RAIL0000001", "Bottom"), ("RAIL0000002", "Top")):
+        table.put_item(Item=_container(cid, status="Loaded_Rail", direction="Export"))
+        consist.load_container("TTZX00001", pos, cid)
+    check("train cannot depart before cutoff", consist.depart(table, now=consist.created_at) == 0)
+    before = [table.get_item(Key={"Container_ID": cid})["Item"]["Current_Status"]
+              for cid in ("RAIL0000001", "RAIL0000002")]
+    check("pre-cutoff attempt changes no container", before == ["Loaded_Rail", "Loaded_Rail"])
+    check("whole loaded consist departs at cutoff",
+          consist.depart(table, now=consist.cutoff_time) == 2)
+    after = [table.get_item(Key={"Container_ID": cid})["Item"]["Current_Status"]
+             for cid in ("RAIL0000001", "RAIL0000002")]
+    check("atomic departure updates every loaded unit", after == ["Departed", "Departed"])
+
+
+def test_outgate_enforces_target_dwell():
+    import outgate
+    table = mock_dynamo.reset_shared_table()
+    outgate.table = table
+    now = datetime.now(timezone.utc)
+    item = _container("ROAD0000001", status="Parked", arrival=now.isoformat(), direction="Import")
+    item["Target_Dwell_Hours"] = "12"
+    table.put_item(Item=item)
+    table.put_item(Item={"Container_ID": "SPOT#1001", "Type": "Spot_Reservation"})
+    original_sleep = outgate.time.sleep
+    outgate.time.sleep = lambda _: None
+    try:
+        check("roadbound unit cannot outgate before target dwell",
+              not outgate.process_outgate(now=now))
+        check("roadbound unit becomes eligible after target dwell",
+              outgate.process_outgate(now=now + timedelta(hours=12, seconds=1)))
+    finally:
+        outgate.time.sleep = original_sleep
+
+
+def test_binding_capacity_records_rollovers():
+    import simulate
+    result = simulate.run_shift(containers=20, hostlers=3, cranes=2, outgates=1,
+                                claim="dispatch", speed=0.0, seed=21, well_capacity=4)
+    check("binding train constraints roll railbound units",
+          result["train"]["rolled_railbound"] > 0
+          and result["train"]["loaded_departed"] + result["train"]["rolled_railbound"] == 10,
+          str(result["train"]))
+    check("rollovers remain valid audited lifecycles", result["exactly_once"],
+          str(result["lifecycle_audit"]["problems"]))
+
+
+def test_adaptive_policy_persists_learning():
+    from adaptive_policy import OnlineDispatchPolicy
+    from pathlib import Path
+    path = Path(__file__).with_name(".test_adaptive_policy.json")
+    if path.exists():
+        path.unlink()
+    policy = OnlineDispatchPolicy(path=path)
+    candidates = [
+        _container("LEARN000001", status="Parked", spot=1100, direction="Export"),
+        _container("LEARN000002", status="Parked", spot=1900, direction="Export"),
+    ]
+    chosen, decision = policy.choose(candidates, current_spot=1101)
+    try:
+        policy.observe(decision, completed=True)
+        reloaded = OnlineDispatchPolicy(path=path)
+        check("adaptive policy writes readable persistent state", path.exists())
+        check("adaptive policy continues learning across shifts",
+              reloaded.total_decisions == 1 and sum(reloaded.counts.values()) == 1)
+    finally:
+        if path.exists():
+            path.unlink()
+
+
+def test_adaptive_policy_cache_is_thread_safe():
+    """Concurrent hostlers must share one policy object and one file lock."""
+    import adaptive_policy
+    from pathlib import Path
+
+    path = Path(__file__).with_name(".test_concurrent_policy.json")
+    old_path = os.environ.get("YMS_POLICY_PATH")
+    os.environ["YMS_POLICY_PATH"] = str(path)
+    adaptive_policy.reset_policy_cache()
+    policies = []
+    workers = [
+        threading.Thread(target=lambda: policies.append(adaptive_policy.get_policy()))
+        for _ in range(20)
+    ]
+    try:
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+        check("concurrent hostlers receive one shared adaptive policy",
+              len(policies) == 20 and len({id(policy) for policy in policies}) == 1)
+    finally:
+        if old_path is None:
+            os.environ.pop("YMS_POLICY_PATH", None)
+        else:
+            os.environ["YMS_POLICY_PATH"] = old_path
+        adaptive_policy.reset_policy_cache()
+        if path.exists():
+            path.unlink()
 
 
 def main():
@@ -410,7 +735,18 @@ def main():
                         test_unsafe_mode_causes_data_corruption,
                         test_claim_strategy_changes_contention,
                         test_dispatch_strategy_eliminates_parking_conflicts,
-                        test_concurrent_gate_clerks_spot_collision]),
+                        test_concurrent_gate_clerks_spot_collision,
+                        test_stack_access_rehandles_blockers,
+                        test_claim_refreshes_a_rehandled_location,
+                        test_stale_unclaimed_move_preserves_the_new_reservation,
+                        test_stale_rehandle_cannot_leave_two_reservations,
+                        test_train_enforces_physical_loading_rules,
+                        test_inbound_bottom_references_actual_top_container,
+                        test_train_cutoff_and_atomic_departure,
+                        test_outgate_enforces_target_dwell,
+                        test_binding_capacity_records_rollovers,
+                        test_adaptive_policy_persists_learning,
+                        test_adaptive_policy_cache_is_thread_safe]),
     ]
 
     for title, tests in groups:

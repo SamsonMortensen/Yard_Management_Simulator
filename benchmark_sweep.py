@@ -1,12 +1,9 @@
 import os
-import sys
 
 # Ensure in-memory mock DynamoDB backend
 os.environ["YMS_BACKEND"] = "memory"
 
 import mock_dynamo
-import config
-from config import get_table, query_status
 import crane
 
 def evaluate_sweep(sweep_mode, travel_delay, lock_delay, data_file="historical_manifest.csv"):
@@ -58,7 +55,7 @@ def run_benchmark():
     print("=" * 80)
     print("  Evaluates 'tops_first' (Tukwila Baseline) vs 'well_by_well'")
     print("  Physics Model: 45s Hoist Cycle, 15s Inter-Well Travel, Variable Cone Unlocking")
-    print("  Metric: Simulated Crane Lifts per Hour (lifts ÷ simulated_hours)")
+    print("  Metric: Simulated Crane Lifts per Hour (lifts / simulated_hours)")
     print("=" * 80)
     print()
 

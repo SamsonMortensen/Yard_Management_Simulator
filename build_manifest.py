@@ -31,6 +31,21 @@ def generate_container():
     cid10 = f"{prefix}{serial}"
     return f"{cid10}{calculate_check_digit(cid10)}", eq, is_domestic
 
+
+def operational_fields(equipment_type, planned_departure_mode):
+    """Create the physical attributes used by yard and train planning."""
+    weight_ranges = {
+        "20_Standard": (18_000, 48_000),
+        "40_High_Cube": (28_000, 62_000),
+        "53_Dry_Van": (24_000, 58_000),
+    }
+    low, high = weight_ranges[equipment_type]
+    return {
+        "Planned_Departure_Mode": planned_departure_mode,
+        "Gross_Weight_Lbs": random.randint(low, high),
+        "Destination_Block": random.choice(["BLOCK_A", "BLOCK_B", "BLOCK_C", "BLOCK_D"]),
+    }
+
 def generate_manifest():
     url = 'https://data.ny.gov/api/views/v6t6-eb7h/rows.csv?accessType=DOWNLOAD'
     try:
@@ -54,56 +69,76 @@ def generate_manifest():
     print(f"Target daily gate moves: {daily_volume}")
 
 
-    # Generate a day's worth of arrivals.
+    # Build one operating day around the latest observed rail volume.
     start_of_day = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
 
     manifest = []
     train_volume = daily_volume // 2
     truck_volume = daily_volume - train_volume
 
-    # Train batches (discharges at 04:00 and 18:00)
-    # Group into railcars
+    # Train arrivals discharge in two work windows and share railcar IDs by well.
     railcar_count = (train_volume // 2) + 1
     for r in range(railcar_count):
         hour = random.choice([4, 18])
-        minute_offset = random.randint(0, 119) # 2-hour discharge
+        minute_offset = random.randint(0, 119)  # Two-hour discharge window.
         arrival = start_of_day + timedelta(hours=hour, minutes=minute_offset)
         railcar_id = f"TTZX{random.randint(100000, 999999)}"
         
-        # Bottom well
+        # A domestic trailer rides single-stack; marine equipment uses a double stack.
         cid_bot, eq_bot, is_dom_bot = generate_container()
         if is_dom_bot:
-            # Domestic TOFC, single stack
-            manifest.append({"Container_ID": cid_bot, "Equipment_Type": eq_bot, "Arrival_Time": arrival.isoformat(), "Arrival_Mode": "Rail", "Railcar_ID": railcar_id, "Well_Position": "Single", "Blocked_By": "None"})
+            manifest.append({
+                "Container_ID": cid_bot, "Equipment_Type": eq_bot,
+                "Arrival_Time": arrival.isoformat(), "Arrival_Mode": "Rail",
+                "Railcar_ID": railcar_id, "Well_Position": "Single", "Blocked_By": "None",
+                **operational_fields(eq_bot, "Road"),
+            })
         else:
-            # Marine, double stack
-            cid_top, eq_top, _ = generate_container()
-            # Ensure top is marine too for simplicity
-            while True:
-                if not _ : break
-                cid_top, eq_top, _ = generate_container()
+            cid_top, eq_top, top_is_domestic = generate_container()
+            # Keep the upper position marine so its length fits this simplified well.
+            while top_is_domestic:
+                cid_top, eq_top, top_is_domestic = generate_container()
             
-            manifest.append({"Container_ID": cid_bot, "Equipment_Type": eq_bot, "Arrival_Time": arrival.isoformat(), "Arrival_Mode": "Rail", "Railcar_ID": railcar_id, "Well_Position": "Bottom", "Blocked_By": cid_top})
-            manifest.append({"Container_ID": cid_top, "Equipment_Type": eq_top, "Arrival_Time": arrival.isoformat(), "Arrival_Mode": "Rail", "Railcar_ID": railcar_id, "Well_Position": "Top", "Blocked_By": "None"})
+            manifest.append({
+                "Container_ID": cid_bot, "Equipment_Type": eq_bot,
+                "Arrival_Time": arrival.isoformat(), "Arrival_Mode": "Rail",
+                "Railcar_ID": railcar_id, "Well_Position": "Bottom", "Blocked_By": cid_top,
+                **operational_fields(eq_bot, "Road"),
+            })
+            manifest.append({
+                "Container_ID": cid_top, "Equipment_Type": eq_top,
+                "Arrival_Time": arrival.isoformat(), "Arrival_Mode": "Rail",
+                "Railcar_ID": railcar_id, "Well_Position": "Top", "Blocked_By": "None",
+                **operational_fields(eq_top, "Road"),
+            })
 
-    # Bimodal truck gate (Morning surge, afternoon push)
+    # Gate arrivals follow a morning surge and a smaller afternoon push.
     for _ in range(truck_volume):
         hour = int(random.normalvariate(7, 1.5)) if random.random() < 0.6 else int(random.normalvariate(14, 1.5))
-        hour = max(5, min(17, hour)) # gate open 05:00-17:59
+        hour = max(5, min(17, hour))  # Gate hours are 05:00 through 17:59.
         minute = random.randint(0, 59)
         arrival = start_of_day + timedelta(hours=hour, minutes=minute)
         cid, eq, _ = generate_container()
-        manifest.append({"Container_ID": cid, "Equipment_Type": eq, "Arrival_Time": arrival.isoformat(), "Arrival_Mode": "Gate", "Railcar_ID": "None", "Well_Position": "None", "Blocked_By": "None"})
+        manifest.append({
+            "Container_ID": cid, "Equipment_Type": eq,
+            "Arrival_Time": arrival.isoformat(), "Arrival_Mode": "Gate",
+            "Railcar_ID": "None", "Well_Position": "None", "Blocked_By": "None",
+            **operational_fields(eq, "Rail"),
+        })
 
 
-    # Sort sequentially by arrival time
+    # The engines consume the manifest in operating order.
     manifest.sort(key=lambda x: x["Arrival_Time"])
 
-    # truncate to daily_volume exactly since railcar grouping might slightly overshoot
+    # Railcar grouping can create one extra unit, so honor the requested daily total.
     manifest = manifest[:daily_volume]
 
-    with open(Path(__file__).parent / "historical_manifest.csv", "w", newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=["Container_ID", "Equipment_Type", "Arrival_Time", "Arrival_Mode", "Railcar_ID", "Well_Position", "Blocked_By"])
+    with open(Path(__file__).parent / "historical_manifest.csv", "w", newline='', encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=[
+            "Container_ID", "Equipment_Type", "Gross_Weight_Lbs", "Destination_Block",
+            "Arrival_Time", "Arrival_Mode", "Planned_Departure_Mode", "Railcar_ID",
+            "Well_Position", "Blocked_By",
+        ])
         writer.writeheader()
         writer.writerows(manifest)
 

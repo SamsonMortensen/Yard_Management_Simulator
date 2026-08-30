@@ -1,245 +1,302 @@
-"""Hostlers. The yard drivers, working both directions.
+"""Move containers between gate, track, and multi-tier ground stacks.
 
-Inbound leg: pick up whatever the crane put down, or a box an outside driver
-dropped at the gate, and park it in its spot.
+The hostler first services units waiting at the gate or under the crane. After
+parking one, it looks for railbound work near that drop location so the return
+trip can become a dual cycle. A buried pickup is not allowed to disappear
+through its blockers: blockers are relocated top-down, each relocation changes
+its ground reservation atomically, and the extra travel is measured.
 
-Outbound leg: go get an export off its spot and drop it trackside as
-Awaiting_Rail so the crane can load it on the train. The SPOT# lock is
-released on the way out, which is what puts that spot back in circulation.
-
-Dual cycling is the part that matters for throughput. After dropping an
-import at a spot, the hostler looks for an export sitting in the same block
-(spot // 100) instead of driving back to the track empty. Same trip, two
-moves.
-
-How a hostler picks its next unit:
-
-  head      take the front of the queue. Every hostler picks the same one,
-            so they collide constantly. One lost race per container.
-  random    draw from anywhere in the queue. Collisions mostly disappear
-            and so does arrival order.
-  dispatch  claim the unit before driving to it. A lost race costs a retry
-            instead of a wasted trip, which is the whole point.
-
-Read from the environment on every call, not once at import, so a harness
-comparing all three in one process gets the right one each time.
+Four selection modes share the same physical rules. ``head`` and ``random``
+demonstrate worker contention, ``dispatch`` claims arrival-sorted work before
+travel, and ``adaptive`` uses the same safe claim while an online learner ranks
+valid railbound candidates.
 """
 import os
 import random
+import threading
 import time
 
 from boto3.dynamodb.conditions import Attr
 from botocore.exceptions import ClientError
 
+from adaptive_policy import get_policy
+from atomic_ops import transition_and_release
 from config import get_table, query_status
+from flow import is_railbound
+from yard_topology import (
+    block_hops,
+    gate_block,
+    rehandle_for_access,
+    track_block,
+    yard_block,
+)
+
 
 table = get_table()
-
 active_hostlers = ["EMP-104", "EMP-227", "EMP-309", "EMP-412"]
+_stats_lock = threading.Lock()
+STATS = {}
+
+
+def reset_stats():
+    global STATS
+    with _stats_lock:
+        STATS = {
+            "ground_moves": 0,
+            "railbound_retrievals": 0,
+            "dual_cycles": 0,
+            "rehandles": 0,
+            "block_hops": 0,
+            "simulated_hostler_seconds": 0.0,
+        }
+
+
+reset_stats()
+
 
 def claim_strategy():
     return os.environ.get("YMS_CLAIM", "head").lower()
 
+
 def is_unsafe():
     return os.environ.get("YMS_UNSAFE", "false").lower() == "true"
 
-def find_dual_cycle_export(table, drop_spot, exclude_cid=None):
-    parked = query_status(table, ['Parked'])
-    exports = [item for item in parked if item.get('Direction') == 'Export' and item.get('Container_ID') != exclude_cid]
-    if not exports:
+
+def _uses_atomic_claim(strategy):
+    return strategy in {"dispatch", "adaptive"}
+
+
+def _is_claim_conflict(error):
+    return error.response['Error']['Code'] in {
+        'ConditionalCheckFailedException', 'TransactionCanceledException'
+    }
+
+
+def _arrival_order(item):
+    return item.get('Arrival_Time', ''), item.get('Container_ID', '')
+
+
+def _record_move(hops, rehandles=0, railbound=False, dual_cycle=False):
+    seconds_per_hop = float(os.environ.get("HOSTLER_SECONDS_PER_BLOCK", "12"))
+    seconds_per_rehandle = float(os.environ.get("REHANDLE_SECONDS", "90"))
+    simulated_seconds = hops * seconds_per_hop + rehandles * seconds_per_rehandle
+    with _stats_lock:
+        STATS["ground_moves"] += 1
+        STATS["railbound_retrievals"] += int(railbound)
+        STATS["dual_cycles"] += int(dual_cycle)
+        STATS["rehandles"] += rehandles
+        STATS["block_hops"] += hops
+        STATS["simulated_hostler_seconds"] += simulated_seconds
+    time.sleep(simulated_seconds)
+
+
+def _claim_candidate(candidates, driver, expected_status=None, only_first=False):
+    """Claim work, then return its authoritative location after the write."""
+    for candidate in candidates[:1] if only_first else candidates:
+        status = expected_status or candidate['Current_Status']
+        try:
+            table.update_item(
+                Key={'Container_ID': candidate['Container_ID']},
+                UpdateExpression="set Current_Status = :s, Claimed_By = :e",
+                ExpressionAttributeValues={':s': 'Claimed', ':e': driver},
+                ConditionExpression=Attr('Current_Status').eq(status),
+            )
+            # A blocker may have moved after the queue scan but before this claim.
+            # Once the claim lands it cannot move again, so reread the exact ground
+            # reservation that the eventual transition must release.
+            return table.get_item(
+                Key={'Container_ID': candidate['Container_ID']}
+            )['Item']
+        except ClientError as error:
+            if not _is_claim_conflict(error):
+                raise
+    return None
+
+
+def _release_claim(container_id):
+    """Return abandoned work to the queue without overwriting a completed move."""
+    try:
+        table.update_item(
+            Key={'Container_ID': container_id},
+            UpdateExpression="set Current_Status = :s",
+            ExpressionAttributeValues={':s': 'Parked'},
+            ConditionExpression=Attr('Current_Status').eq('Claimed'),
+        )
+    except ClientError as error:
+        if not _is_claim_conflict(error):
+            raise
+
+
+def _park_inbound(driver, strategy, unsafe):
+    waiting = query_status(table, ['Ingate_Hold', 'Buffer_Hold', 'Rendezvous_Wait'])
+    waiting.sort(key=_arrival_order)
+    if not waiting:
         return None
-    
-    target_block = drop_spot // 100
-    block_matches = [item for item in exports if (item.get('Assigned_Spot', 0) // 100) == target_block]
-    if block_matches:
-        return block_matches[0]
-    return exports[0]
+
+    if _uses_atomic_claim(strategy) and not unsafe:
+        container = _claim_candidate(waiting, driver)
+        if container is None:
+            return False
+        expected_status = 'Claimed'
+    else:
+        container = random.choice(waiting) if strategy == 'random' else waiting[0]
+        expected_status = container['Current_Status']
+
+    source = track_block() if container.get('Arrival_Mode') == 'Rail' else gate_block()
+    hops = abs(source - yard_block(container['Assigned_Spot']))
+    _record_move(hops)
+
+    values = {':s': 'Parked', ':e': driver}
+    if unsafe:
+        table.update_item(
+            Key={'Container_ID': container['Container_ID']},
+            UpdateExpression="set Current_Status = :s, Parked_By_Employee = :e",
+            ExpressionAttributeValues=values,
+        )
+        return container
+    try:
+        table.update_item(
+            Key={'Container_ID': container['Container_ID']},
+            UpdateExpression="set Current_Status = :s, Parked_By_Employee = :e",
+            ExpressionAttributeValues=values,
+            ConditionExpression=Attr('Current_Status').eq(expected_status),
+        )
+        return container
+    except ClientError as error:
+        if _is_claim_conflict(error):
+            return False
+        raise
+
+
+def _select_railbound(candidates, strategy, origin_spot):
+    candidates.sort(key=_arrival_order)
+    if strategy == 'adaptive':
+        return get_policy().choose(candidates, current_spot=origin_spot)
+    if strategy == 'random':
+        return random.choice(candidates), None
+    if origin_spot is not None:
+        origin_block = yard_block(origin_spot)
+        nearby = [item for item in candidates if yard_block(item['Assigned_Spot']) == origin_block]
+        if nearby:
+            return nearby[0], None
+    return candidates[0], None
+
+
+def _retrieve_railbound(driver, strategy, unsafe, origin_spot=None):
+    candidates = [item for item in query_status(table, ['Parked']) if is_railbound(item)]
+    if not candidates:
+        return False
+
+    selected, decision = _select_railbound(candidates, strategy, origin_spot)
+    if _uses_atomic_claim(strategy) and not unsafe:
+        selected = _claim_candidate(
+            [selected] if strategy == 'adaptive' else candidates,
+            driver,
+            expected_status='Parked',
+            only_first=strategy == 'adaptive',
+        )
+        if selected is None:
+            if strategy == 'adaptive':
+                get_policy().observe(decision, completed=False)
+            return True
+        expected_status = 'Claimed'
+    else:
+        expected_status = 'Parked'
+
+    try:
+        rehandle = rehandle_for_access(table, selected, driver)
+        start_block = yard_block(origin_spot) if origin_spot is not None else track_block()
+        pickup_block = yard_block(selected['Assigned_Spot'])
+        travel_hops = abs(start_block - pickup_block) + abs(pickup_block - track_block())
+        total_hops = travel_hops + rehandle['block_hops']
+        _record_move(
+            total_hops,
+            rehandles=rehandle['rehandles'],
+            railbound=True,
+            dual_cycle=origin_spot is not None,
+        )
+
+        values = {
+            ':s': 'Awaiting_Rail',
+            ':e': driver,
+            ':r': int(selected.get('Rehandle_Count', 0)) + rehandle['rehandles'],
+        }
+        update = "set Current_Status = :s, Parked_By_Employee = :e, Rehandle_Count = :r"
+        if unsafe:
+            table.update_item(
+                Key={'Container_ID': selected['Container_ID']},
+                UpdateExpression=update,
+                ExpressionAttributeValues=values,
+            )
+            table.delete_item(Key={'Container_ID': selected.get(
+                'Ground_Reservation_ID', f"SPOT#{selected['Assigned_Spot']}"
+            )})
+        else:
+            transition_and_release(
+                table,
+                selected['Container_ID'],
+                selected['Assigned_Spot'],
+                update,
+                values,
+                expected_status=expected_status,
+                reservation_key=selected.get('Ground_Reservation_ID'),
+                expected_reservation=selected.get('Ground_Reservation_ID'),
+            )
+
+        if strategy == 'adaptive':
+            decision.update({
+                'observed_block_hops': total_hops,
+                'rehandles': rehandle['rehandles'],
+            })
+            get_policy().observe(decision, completed=True)
+        return True
+    except ClientError as error:
+        if expected_status == 'Claimed':
+            _release_claim(selected['Container_ID'])
+        if strategy == 'adaptive':
+            get_policy().observe(decision, completed=False)
+        if _is_claim_conflict(error):
+            return True
+        raise
+
 
 def move_container():
     driver = random.choice(active_hostlers)
     strategy = claim_strategy()
     unsafe = is_unsafe()
 
-    # 1. Inbound Queues (Gate arrivals & Crane discharge)
-    gate_items = query_status(table, ['Ingate_Hold', 'Buffer_Hold', 'Rendezvous_Wait'])
-
-    if gate_items:
-        if strategy == "dispatch" and not unsafe:
-            container_id = None
-            assigned_spot = None
-            for candidate in gate_items:
-                candidate_id = candidate['Container_ID']
-                try:
-                    table.update_item(
-                        Key={'Container_ID': candidate_id},
-                        UpdateExpression="set Current_Status = :s, Claimed_By = :e",
-                        ExpressionAttributeValues={':s': 'Claimed', ':e': driver},
-                        ConditionExpression=Attr('Current_Status').eq(candidate['Current_Status'])
-                    )
-                    container_id = candidate_id
-                    assigned_spot = candidate['Assigned_Spot']
-                    break
-                except ClientError as e:
-                    if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
-                        continue
-                    raise
-
-            if not container_id:
-                return True
-
-            time.sleep(2)
-
-            table.update_item(
-                Key={'Container_ID': container_id},
-                UpdateExpression="set Current_Status = :s, Parked_By_Employee = :e",
-                ExpressionAttributeValues={':s': 'Parked', ':e': driver},
-                ConditionExpression=Attr('Current_Status').eq('Claimed')
+    parked = _park_inbound(driver, strategy, unsafe)
+    if parked is not None:
+        if parked is not False:
+            _retrieve_railbound(
+                driver,
+                strategy,
+                unsafe,
+                origin_spot=parked['Assigned_Spot'],
             )
-
-            # Dual cycling opportunity
-            export_candidate = find_dual_cycle_export(table, assigned_spot, exclude_cid=container_id)
-            if export_candidate:
-                exp_id = export_candidate['Container_ID']
-                exp_spot = export_candidate['Assigned_Spot']
-                try:
-                    table.update_item(
-                        Key={'Container_ID': exp_id},
-                        UpdateExpression="set Current_Status = :s, Claimed_By = :e",
-                        ExpressionAttributeValues={':s': 'Claimed', ':e': driver},
-                        ConditionExpression=Attr('Current_Status').eq('Parked')
-                    )
-                    time.sleep(2)
-                    table.update_item(
-                        Key={'Container_ID': exp_id},
-                        UpdateExpression="set Current_Status = :s, Parked_By_Employee = :e",
-                        ExpressionAttributeValues={':s': 'Awaiting_Rail', ':e': driver},
-                        ConditionExpression=Attr('Current_Status').eq('Claimed')
-                    )
-                    table.delete_item(Key={'Container_ID': f"SPOT#{exp_spot}"})
-                except ClientError as e:
-                    if e.response['Error']['Code'] != 'ConditionalCheckFailedException':
-                        raise
-            return True
-
-        container = random.choice(gate_items) if strategy == "random" else gate_items[0]
-        container_id = container['Container_ID']
-        assigned_spot = container['Assigned_Spot']
-
-        time.sleep(2)
-
-        if unsafe:
-            table.update_item(
-                Key={'Container_ID': container_id},
-                UpdateExpression="set Current_Status = :s, Parked_By_Employee = :e",
-                ExpressionAttributeValues={':s': 'Parked', ':e': driver}
-            )
-            return True
-
-        try:
-            table.update_item(
-                Key={'Container_ID': container_id},
-                UpdateExpression="set Current_Status = :s, Parked_By_Employee = :e",
-                ExpressionAttributeValues={':s': 'Parked', ':e': driver},
-                ConditionExpression=Attr('Current_Status').eq(container['Current_Status'])
-            )
-        except ClientError as e:
-            if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
-                return True
-            raise
-
         return True
+    return _retrieve_railbound(driver, strategy, unsafe)
 
-    # 2. Outbound Retrieval Queue (Parked units with Direction == 'Export')
-    parked_items = query_status(table, ['Parked'])
-    export_items = [item for item in parked_items if item.get('Direction') == 'Export']
-
-    if export_items:
-        if strategy == "dispatch" and not unsafe:
-            container_id = None
-            assigned_spot = None
-            for candidate in export_items:
-                candidate_id = candidate['Container_ID']
-                try:
-                    table.update_item(
-                        Key={'Container_ID': candidate_id},
-                        UpdateExpression="set Current_Status = :s, Claimed_By = :e",
-                        ExpressionAttributeValues={':s': 'Claimed', ':e': driver},
-                        ConditionExpression=Attr('Current_Status').eq('Parked')
-                    )
-                    container_id = candidate_id
-                    assigned_spot = candidate['Assigned_Spot']
-                    break
-                except ClientError as e:
-                    if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
-                        continue
-                    raise
-
-            if not container_id:
-                return True
-
-            time.sleep(2)
-
-            table.update_item(
-                Key={'Container_ID': container_id},
-                UpdateExpression="set Current_Status = :s, Parked_By_Employee = :e",
-                ExpressionAttributeValues={':s': 'Awaiting_Rail', ':e': driver},
-                ConditionExpression=Attr('Current_Status').eq('Claimed')
-            )
-            table.delete_item(Key={'Container_ID': f"SPOT#{assigned_spot}"})
-            return True
-
-        container = random.choice(export_items) if strategy == "random" else export_items[0]
-        container_id = container['Container_ID']
-        assigned_spot = container['Assigned_Spot']
-
-        time.sleep(2)
-
-        if unsafe:
-            table.update_item(
-                Key={'Container_ID': container_id},
-                UpdateExpression="set Current_Status = :s, Parked_By_Employee = :e",
-                ExpressionAttributeValues={':s': 'Awaiting_Rail', ':e': driver}
-            )
-            table.delete_item(Key={'Container_ID': f"SPOT#{assigned_spot}"})
-            return True
-
-        try:
-            table.update_item(
-                Key={'Container_ID': container_id},
-                UpdateExpression="set Current_Status = :s, Parked_By_Employee = :e",
-                ExpressionAttributeValues={':s': 'Awaiting_Rail', ':e': driver},
-                ConditionExpression=Attr('Current_Status').eq('Parked')
-            )
-            table.delete_item(Key={'Container_ID': f"SPOT#{assigned_spot}"})
-        except ClientError as e:
-            if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
-                return True
-            raise
-
-        return True
-
-    return False
 
 def run_shift():
     empty_passes = 0
     try:
         while empty_passes < 10:
-            moved = move_container()
-            if not moved:
-                if query_status(table, ['Trackside_Hold', 'Buffer_Hold', 'Rendezvous_Wait', 'Ingate_Hold', 'Claimed']):
-                    time.sleep(0.05)
-                    continue
-                parked = query_status(table, ['Parked'])
-                if any(item.get('Direction') == 'Export' for item in parked):
-                    time.sleep(0.05)
-                    continue
-                empty_passes += 1
-                time.sleep(0.05)
-            else:
+            if move_container():
                 empty_passes = 0
-                time.sleep(0.05)
+            elif query_status(table, [
+                'Trackside_Hold', 'Buffer_Hold', 'Rendezvous_Wait',
+                'Ingate_Hold', 'Claimed',
+            ]):
+                pass
+            elif any(is_railbound(item) for item in query_status(table, ['Parked'])):
+                pass
+            else:
+                empty_passes += 1
+            time.sleep(0.05)
     except KeyboardInterrupt:
         pass
+
 
 if __name__ == "__main__":
     run_shift()

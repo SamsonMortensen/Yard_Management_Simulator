@@ -7,16 +7,15 @@ import json
 import pandas as pd
 import streamlit as st
 import numpy as np
-import statsmodels.api as sm
 from statsmodels.tsa.seasonal import seasonal_decompose
 
 from config import YARD_CAPACITY, get_table, scan_all
 
-#Page Config
+# Configure the page before Streamlit renders any dashboard element.
 st.set_page_config(page_title="Yard Operations", layout="wide")
 st.title("Yard Management Dashboard")
 
-#Connect to AWS
+# The configured backend may be DynamoDB or the in-memory simulation table.
 table = get_table()
 
 @st.cache_data(ttl=5)
@@ -57,7 +56,7 @@ def fetch_stable_regime():
         seasonal_map = df[df.index.year == 2014]['Seasonal'].to_dict()
         seasonal_dict = {k.month: v for k, v in seasonal_map.items()}
         
-        # Backtest: July 2015 to Dec 2015
+        # Hold out July through December 2015 for an honest historical comparison.
         backtest_dates = pd.date_range(start='2015-07-01', periods=6, freq='MS')
         backtest_x = np.arange(len(recent_trend), len(recent_trend) + 6)
         backtest_trend = slope * backtest_x + intercept
@@ -76,7 +75,7 @@ def fetch_stable_regime():
             'Naive Baseline (2014)': naive
         }, index=backtest_dates)
         
-        # Forward Projection
+        # Project the next six months only after the backtest is complete.
         future_dates = pd.date_range(start='2016-01-01', periods=6, freq='MS')
         future_x = np.arange(len(recent_trend) + 6, len(recent_trend) + 12)
         projected_trend = slope * future_x + intercept
@@ -104,7 +103,7 @@ def fetch_stress_regime():
         df['Date'] = pd.to_datetime(df['unnamed_column'])
         df = df.sort_values('Date').set_index('Date')
         
-        # We only care about NY/NJ. Use physical containers (/1.65)
+        # Convert NY/NJ TEUs to approximate physical containers at 1.65 TEU each.
         df['Containers'] = pd.to_numeric(df['ny_nj']) / 1.65
         
         decomposition = seasonal_decompose(df['Containers'], model='additive', period=12)
@@ -112,7 +111,7 @@ def fetch_stress_regime():
         df['Seasonal'] = decomposition.seasonal
         
         valid_trend = df['Trend'].dropna()
-        # Use valid trend leading up to the holdout. (Jul 2020 to Feb 2023)
+        # Fit only the valid trend leading up to the March 2023 holdout.
         recent_trend = valid_trend
         
         x = np.arange(len(recent_trend))
@@ -122,7 +121,7 @@ def fetch_stress_regime():
         seasonal_map = df[df.index.year == 2021]['Seasonal'].to_dict()
         seasonal_dict = {k.month: v for k, v in seasonal_map.items()}
         
-        # Backtest: Mar 2023 to Aug 2023
+        # Hold out March through August 2023 to expose stress-regime error.
         backtest_dates = pd.date_range(start='2023-03-01', periods=6, freq='MS')
         backtest_x = np.arange(len(recent_trend), len(recent_trend) + 6)
         backtest_trend = slope * backtest_x + intercept
@@ -146,7 +145,9 @@ def fetch_stress_regime():
     except Exception as e:
         return None, None, None, None
 
-tab_live, tab_forecast = st.tabs(["Live Yard Metrics", "Demand Forecasting (Baseline vs Stress)"])
+tab_live, tab_learning, tab_forecast = st.tabs([
+    "Live Yard Metrics", "Adaptive Dispatch", "Demand Forecasting (Baseline vs Stress)"
+])
 
 with tab_live:
     if st.button("Refresh Live Data"):
@@ -155,7 +156,13 @@ with tab_live:
     df = load_data()
 
     if not df.empty:
-        df = df[~df['Container_ID'].str.startswith('SPOT#')]
+        df = df[~df['Container_ID'].str.startswith(('SPOT#', 'GROUND#'))]
+        if 'Planned_Departure_Mode' not in df:
+            df['Planned_Departure_Mode'] = np.where(df.get('Direction') == 'Export', 'Rail', 'Road')
+        elif 'Direction' in df:
+            legacy = np.where(df['Direction'] == 'Export', 'Rail', 'Road')
+            df['Planned_Departure_Mode'] = df['Planned_Departure_Mode'].fillna(pd.Series(legacy, index=df.index))
+        df['Flow'] = df['Planned_Departure_Mode'].map({'Rail': 'Railbound', 'Road': 'Roadbound'})
 
     if df.empty:
         st.info("The yard is currently empty. Run simulate.py to generate traffic.")
@@ -163,7 +170,7 @@ with tab_live:
         in_yard = df[df['Current_Status'] != 'Departed'].copy()
         departed = df[df['Current_Status'] == 'Departed']
 
-        col1, col2, col3, col4, col5 = st.columns(5)
+        col1, col2, col3, col4, col5, col6 = st.columns(6)
         
         with col1:
             st.metric("Containers in Yard", len(in_yard))
@@ -188,6 +195,30 @@ with tab_live:
                 arrivals = pd.to_datetime(parked['Arrival_Time'], utc=True)
                 standing_hrs = ((now - arrivals).dt.total_seconds() / 3600).mean()
                 st.metric("Standing Dwell (Parked)", f"{standing_hrs:.2f} hrs")
+        with col6:
+            rolled = len(in_yard[(in_yard['Flow'] == 'Railbound')
+                                 & (in_yard['Current_Status'] == 'Awaiting_Rail')])
+            st.metric("Railbound Awaiting Next Train", rolled)
+
+        ground_cols = st.columns(3)
+        tiers = in_yard['Ground_Tier'] if 'Ground_Tier' in in_yard else pd.Series(1, index=in_yard.index)
+        moves = df['Rehandle_Count'] if 'Rehandle_Count' in df else pd.Series(0, index=df.index)
+        blocks = in_yard['Yard_Block'] if 'Yard_Block' in in_yard else pd.Series(dtype=float)
+        stacked = pd.to_numeric(tiers, errors='coerce').fillna(1) > 1
+        rehandles = pd.to_numeric(moves, errors='coerce').fillna(0).sum()
+        active_blocks = pd.to_numeric(blocks, errors='coerce').dropna().nunique()
+        ground_cols[0].metric("Units Above Ground Tier", int(stacked.sum()))
+        ground_cols[1].metric("Recorded Rehandles", int(rehandles))
+        ground_cols[2].metric("Active Yard Blocks", int(active_blocks))
+
+        st.subheader("Outbound Train Readiness")
+        railbound = df[df['Flow'] == 'Railbound']
+        train_cols = st.columns(3)
+        train_cols[0].metric("Loaded on Train", len(railbound[railbound['Current_Status'] == 'Loaded_Rail']))
+        train_cols[1].metric("Awaiting Rail", len(railbound[railbound['Current_Status'] == 'Awaiting_Rail']))
+        train_cols[2].metric("Departed by Rail", len(railbound[
+            (railbound['Current_Status'] == 'Departed') & (railbound.get('Departure_Mode') == 'Rail')
+        ]))
 
         st.markdown("----------")
         st.subheader("Shift Occupancy Curve")
@@ -208,15 +239,43 @@ with tab_live:
             now = datetime.now(timezone.utc)
             arrivals = pd.to_datetime(in_yard['Arrival_Time'], utc=True)
             in_yard['Hours_In_Yard'] = ((now - arrivals).dt.total_seconds() / 3600).round(2)
-            in_yard = in_yard[['Container_ID', 'Assigned_Spot', 'Equipment_Type', 'Current_Status', 'Arrival_Time', 'Hours_In_Yard']]
+            roster_columns = [
+                'Container_ID', 'Flow', 'Yard_Block', 'Assigned_Spot', 'Ground_Tier',
+                'Equipment_Type', 'Gross_Weight_Lbs', 'Destination_Block',
+                'Current_Status', 'Arrival_Time', 'Hours_In_Yard', 'Rehandle_Count',
+            ]
+            in_yard = in_yard[[c for c in roster_columns if c in in_yard.columns]]
             st.dataframe(in_yard, use_container_width=True, hide_index=True)
 
         st.subheader("Departure Log")
         if departed.empty:
             st.caption("No departures logged yet.")
         else:
-            departed_view = departed[['Container_ID', 'Equipment_Type', 'Arrival_Time', 'Dwell_Time_Hours']]
+            departure_columns = ['Container_ID', 'Flow', 'Departure_Mode', 'Equipment_Type',
+                                 'Arrival_Time', 'Dwell_Time_Hours']
+            departed_view = departed[[c for c in departure_columns if c in departed.columns]]
             st.dataframe(departed_view, use_container_width=True, hide_index=True)
+
+with tab_learning:
+    st.header("Adaptive Railbound Dispatch")
+    st.write(
+        "The online learner chooses only among physically valid, unclaimed railbound units. "
+        "It compares FIFO, nearest-block, and cutoff-priority rules; hard safety and train "
+        "constraints remain outside machine-learning control."
+    )
+    policy_path = os.environ.get("YMS_POLICY_PATH", "adaptive_policy.json")
+    if os.path.exists(policy_path):
+        with open(policy_path, "r", encoding="utf-8") as policy_file:
+            policy = json.load(policy_file)
+        st.metric("Completed Learning Decisions", policy.get("total_decisions", 0))
+        policy_frame = pd.DataFrame({
+            "Times Selected": policy.get("counts", {}),
+            "Learned Mean Reward": policy.get("values", {}),
+        })
+        st.dataframe(policy_frame, use_container_width=True)
+        st.caption(f"Policy state: {policy_path} | Updated: {policy.get('updated_at', 'unknown')}")
+    else:
+        st.info("Run `python simulate.py --claim adaptive` to create the first learned policy.")
 
 with tab_forecast:
     st.header("Forecasting Models: Regimes & Structural Shocks")

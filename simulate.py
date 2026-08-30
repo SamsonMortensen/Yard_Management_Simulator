@@ -16,21 +16,23 @@ What it measures
    - Every detected conflict is an actual physical collision intercepted and prevented.
 
 3. Queue Optimization Trade-offs:
-   - head: preserves FIFO at the cost of contention.
+   - head: targets the same queue head at the cost of contention.
    - random: drops contention but violates arrival order.
-   - dispatch: atomic pre-claim eliminates contention while preserving 100% FIFO.
+   - dispatch: arrival-sorted atomic pre-claim avoids driving to already-claimed work.
+   - adaptive: safely learns among FIFO, nearest-block and cutoff-priority rules.
 
 4. Bidirectional Intermodal Operations:
-   - Import flow: Inbound Train -> Offload (Tops first) -> Hostler Park -> Customer Road Outgate.
-   - Export flow: Ingate Road -> Park -> Hostler Retrieve (Dual-Cycle) -> Crane Load (Bottoms first) -> Outbound Train Depart.
+   - Roadbound: Inbound Train -> Offload (tops first) -> Hostler Park -> Road Outgate.
+   - Railbound: Road Ingate -> Park -> Hostler Retrieve -> Crane Load -> Train Depart.
 """
 import argparse
 import io
 import os
 import random
-import sys
 import threading
 import time
+import math
+from datetime import datetime, timedelta, timezone
 from contextlib import redirect_stdout
 
 os.environ["YMS_BACKEND"] = "memory"
@@ -84,28 +86,49 @@ def monitor_occupancy(table, stop_event, log_file):
             _REAL_SLEEP(0.1)
 
 def run_shift(containers=60, hostlers=2, cranes=2, outgates=1, claim="head",
-              unsafe=False, speed=0.01, page_size=25, seed=42, verbose=False, data_file=None, seed_inventory=0, log_file="occupancy_log.csv"):
+              unsafe=False, speed=0.01, page_size=25, seed=42, verbose=False,
+              data_file=None, seed_inventory=0, log_file="occupancy_log.csv",
+              well_capacity=None, cutoff_minutes=60.0, policy_file=None,
+              block_size=100, max_tiers=3):
     """Runs a full bidirectional yard shift. Returns the measurements."""
     random.seed(seed)
     os.environ["YMS_CLAIM"] = claim
     os.environ["YMS_UNSAFE"] = "true" if unsafe else "false"
     os.environ["YMS_BACKEND"] = "memory"
+    os.environ["YMS_BLOCK_SIZE"] = str(block_size)
+    os.environ["YMS_MAX_TIERS"] = str(max_tiers)
+    if policy_file:
+        os.environ["YMS_POLICY_PATH"] = policy_file
 
     import mock_dynamo
     table = mock_dynamo.reset_shared_table(page_size=page_size)
 
     import train
     train.reset_trains()
-    outbound_train = train.get_outbound_train("TR-OUT-01", well_capacity=max(10, (containers // 2) + 2))
+    expected_railbound = containers // 2
+    selected_wells = (
+        well_capacity if well_capacity is not None
+        else max(4, math.ceil(expected_railbound / 2) + 3)
+    )
+    outbound_train = train.get_outbound_train(
+        "TR-OUT-01", well_capacity=selected_wells, cutoff_minutes=cutoff_minutes
+    )
 
     import main as ingate_engine
     import hostler as hostler_engine
     import crane as crane_engine
     import outgate as outgate_engine
     import dispatch_check
+    from flow import is_roadbound, is_railbound
+    from yard_topology import is_reservation_id
+
+    hostler_engine.reset_stats()
+    crane_engine.reset_stats()
+    outgate_engine.reset_stats()
 
     _compress_time(speed)
     sink = io.StringIO()
+    monitor_controls = []
 
     def _run_all():
         started = time.perf_counter()
@@ -113,6 +136,7 @@ def run_shift(containers=60, hostlers=2, cranes=2, outgates=1, claim="head",
         stop_event = threading.Event()
         occ_thread = threading.Thread(target=monitor_occupancy, args=(table, stop_event, log_file))
         occ_thread.start()
+        monitor_controls.append((stop_event, occ_thread))
 
         if seed_inventory > 0:
             ingate_engine.seed_yard_inventory(seed_inventory)
@@ -131,15 +155,23 @@ def run_shift(containers=60, hostlers=2, cranes=2, outgates=1, claim="head",
             worker.join()
         snapshot_parking = dict(table.stats)
 
-        # TAS verification on grounded import units before departure
-        parked_imports = [i["Container_ID"] for i in table.all_items()
-                          if i.get("Current_Status") == "Parked" and i.get("Direction", "Import") == "Import"]
-        parked_sample = parked_imports[:1] if parked_imports else []
+        # TAS verification on grounded roadbound units before departure.
+        parked_roadbound = [i["Container_ID"] for i in table.all_items()
+                            if i.get("Current_Status") == "Parked" and is_roadbound(i)]
+        parked_sample = parked_roadbound[:1] if parked_roadbound else []
         approved_count = sum(1 if dispatch_check.check_appointment(cid) else 0
                              for cid in parked_sample)
 
         # Outgate road units
-        o_workers = [threading.Thread(target=outgate_engine.run_shift, name=f"outgate-{i}")
+        roadbound_items = [i for i in table.all_items() if is_roadbound(i) and i.get('Arrival_Time')]
+        ready_time = datetime.now(timezone.utc)
+        if roadbound_items:
+            ready_time = max(
+                datetime.fromisoformat(i['Arrival_Time'].replace('Z', '+00:00'))
+                + timedelta(hours=float(i.get('Target_Dwell_Hours', 12.5)))
+                for i in roadbound_items
+            ) + timedelta(seconds=1)
+        o_workers = [threading.Thread(target=outgate_engine.run_shift, kwargs={'now': ready_time}, name=f"outgate-{i}")
                      for i in range(outgates)]
         for worker in o_workers:
             worker.start()
@@ -147,7 +179,9 @@ def run_shift(containers=60, hostlers=2, cranes=2, outgates=1, claim="head",
             worker.join()
 
         # Outbound train departure event
-        train_departed_count = outbound_train.depart(table)
+        train_departed_count = outbound_train.depart(
+            table, now=outbound_train.cutoff_time, unsafe=unsafe
+        )
 
         stop_event.set()
         occ_thread.join()
@@ -170,13 +204,17 @@ def run_shift(containers=60, hostlers=2, cranes=2, outgates=1, claim="head",
                 after_ingate, after_parking, elapsed, dry_run_attempts, dry_runs_denied, parked_checked, parked_approved, train_departed_count = _run_all()
         final = dict(table.stats)
     finally:
+        for stop_event, occ_thread in monitor_controls:
+            stop_event.set()
+            if occ_thread.is_alive():
+                occ_thread.join(timeout=2)
         _restore_time()
 
     items = table.all_items()
     statuses = {}
     departure_modes = {}
     for item in items:
-        status = item.get("Current_Status", "Spot_Reservation")
+        status = item.get("Current_Status", item.get("Type", "Unknown_Record"))
         statuses[status] = statuses.get(status, 0) + 1
         if status == "Departed":
             mode = item.get("Departure_Mode", "Road")
@@ -186,36 +224,39 @@ def run_shift(containers=60, hostlers=2, cranes=2, outgates=1, claim="head",
     park_conflicts = after_parking["update_conflicts"] - after_ingate["update_conflicts"]
     successful_park_writes = after_parking.get("successful_parks", 0) - after_ingate.get("successful_parks", 0)
 
-    total_containers = len([i for i in items if not i.get("Container_ID", "").startswith("SPOT#")])
+    total_containers = len([
+        item for item in items if not is_reservation_id(item.get("Container_ID", ""))
+    ])
     seeded = seed_inventory
     
-    active_rail = len([i for i in items if i.get('Arrival_Mode') == 'Rail' and i.get('Parked_By_Employee') != 'SEED_SYSTEM'])
-    active_gate = len([i for i in items if i.get('Arrival_Mode') == 'Gate' and i.get('Parked_By_Employee') != 'SEED_SYSTEM'])
-    
-    # Calculate exact expected writes:
-    # Rail (Import): Crane discharge + Hostler park + Outgate road
-    # Gate (Export): Hostler in-park + Hostler retrieve awaiting rail + Crane load + Train depart
-    if claim == "dispatch":
-        expected_total_writes = (5 * active_rail) + (7 * active_gate)
-    else:
-        expected_total_writes = (3 * active_rail) + (4 * active_gate)
-
     successful_writes = final["updates"] - final["update_conflicts"]
-    exactly_once = (successful_writes == expected_total_writes) and not unsafe
+    from transition_audit import audit_lifecycles
+    lifecycle_audit = audit_lifecycles(table.all_events(), items)
+    exactly_once = lifecycle_audit["passed"] and not unsafe
     double_park_writes = max(0, successful_park_writes - total_containers) if unsafe else 0
 
-    # Spot lock consistency: every parked unit holds exactly one SPOT# record and
-    # no lock is left orphaned behind a unit that already left. Holds on an empty
-    # yard too, where both sides are zero, so it is not a check on occupancy.
-    standing_pop = (statuses.get("Parked", 0) == statuses.get("Spot_Reservation", 0))
+    # Ground-lock consistency: every parked unit owns one exact spot-tier
+    # reservation, and no departed unit leaves an orphaned claim behind.
+    standing_pop = (
+        statuses.get("Parked", 0)
+        == statuses.get("Ground_Reservation", 0) + statuses.get("Spot_Reservation", 0)
+    )
+    rolled_railbound = len([i for i in items if is_railbound(i) and i.get('Current_Status') == 'Awaiting_Rail'])
+    learning = None
+    if claim == 'adaptive':
+        from adaptive_policy import get_policy
+        learning = get_policy().snapshot()
 
     return {
         "config": {
             "containers": containers, "hostlers": hostlers, "cranes": cranes, "outgates": outgates,
             "claim": claim, "unsafe": unsafe, "page_size": page_size, "seed": seed,
+            "well_capacity": selected_wells, "cutoff_minutes": cutoff_minutes,
+            "block_size": block_size,
+            "max_tiers": max_tiers,
         },
         "elapsed_seconds": elapsed,
-        "ingated": len(items),
+        "ingated": total_containers,
         "statuses": statuses,
         "departure_modes": departure_modes,
         "park_attempts": park_attempts,
@@ -225,7 +266,7 @@ def run_shift(containers=60, hostlers=2, cranes=2, outgates=1, claim="head",
         "park_conflicts": park_conflicts,
         "total_conflicts": final["update_conflicts"],
         "successful_writes": successful_writes,
-        "expected_writes": expected_total_writes,
+        "lifecycle_audit": lifecycle_audit,
         "exactly_once": exactly_once,
         "standing_population": standing_pop,
         "dry_runs_denied": dry_runs_denied,
@@ -233,6 +274,20 @@ def run_shift(containers=60, hostlers=2, cranes=2, outgates=1, claim="head",
         "parked_checked": parked_checked,
         "parked_approved": parked_approved,
         "tas_verified": (parked_approved == parked_checked and dry_runs_denied == len(dry_run_attempts)),
+        "train": {
+            "train_id": outbound_train.train_id,
+            "well_capacity": outbound_train.well_capacity,
+            "slot_capacity": outbound_train.slot_capacity,
+            "loaded_departed": train_departed_count,
+            "rolled_railbound": rolled_railbound,
+            "cutoff_minutes": cutoff_minutes,
+        },
+        "learning": learning,
+        "physical_metrics": {
+            "hostler": dict(hostler_engine.STATS),
+            "crane": dict(crane_engine.STATS),
+            "outgate": dict(outgate_engine.STATS),
+        },
         "scans": final["scans"] - after_ingate.get("scans", 0),
         "scan_pages": final["scan_pages"] - after_ingate.get("scan_pages", 0),
         "rows_read_by_scans": final["items_read_by_scans"] - after_ingate.get("items_read_by_scans", 0),
@@ -286,23 +341,34 @@ def render(result):
     if cfg["unsafe"]:
         lines.append(f"    park updates executed                        [FAIL]  "
                      f"{result['park_writes']} writes (CORRUPTION: {result['double_park_writes']} duplicate park events)")
-        lines.append(f"    every parked unit holds one spot lock        [PASS]  "
+        lines.append(f"    every parked unit holds one ground-tier lock [PASS]  "
                      f"{result['statuses']}")
         lines.append(f"    TAS validation (grounded vs dry runs)        [PASS]  "
                      f"{result['parked_approved']}/{result['parked_checked']} approved, "
                      f"{result['dry_runs_denied']}/{result['dry_run_attempts']} denied")
     else:
         ok = "PASS" if result["exactly_once"] else "FAIL"
-        lines.append(f"    every transition recorded exactly once       [{ok}]  "
-                     f"{result['successful_writes']} writes, expected {result['expected_writes']}")
+        lines.append(f"    every lifecycle transition is valid          [{ok}]  "
+                     f"{result['lifecycle_audit']['containers_checked']} containers audited")
         ok = "PASS" if result.get("standing_population") else "FAIL"
-        lines.append(f"    every parked unit holds one spot lock        [{ok}]  "
+        lines.append(f"    every parked unit holds one ground-tier lock [{ok}]  "
                      f"{result['statuses']}")
         ok = "PASS" if result["tas_verified"] else "FAIL"
         lines.append(f"    TAS validation (grounded vs dry runs)        [{ok}]  "
                      f"{result['parked_approved']}/{result['parked_checked']} approved, "
                      f"{result['dry_runs_denied']}/{result['dry_run_attempts']} denied")
         lines.append(f"    departures by mode:                          {result.get('departure_modes', {})}")
+        lines.append(f"    outbound train:                              "
+                     f"{result['train']['loaded_departed']}/{result['train']['slot_capacity']} slots departed, "
+                     f"{result['train']['rolled_railbound']} railbound rolled")
+        if result.get('learning'):
+            lines.append(f"    adaptive dispatch learner:                   "
+                         f"{result['learning']['total_decisions']} decisions, "
+                         f"values={result['learning']['values']}")
+        hostler_metrics = result['physical_metrics']['hostler']
+        lines.append(f"    hostler travel / rehandles:                  "
+                     f"{hostler_metrics['block_hops']} block hops / "
+                     f"{hostler_metrics['rehandles']} rehandles")
 
     lines.append("")
     lines.append("  Write Contention & Collision Prevention")
@@ -324,7 +390,14 @@ if __name__ == "__main__":
     parser.add_argument("--hostlers", type=int, default=3)
     parser.add_argument("--cranes", type=int, default=2)
     parser.add_argument("--outgates", type=int, default=1)
-    parser.add_argument("--claim", choices=["head", "random", "dispatch"], default="dispatch")
+    parser.add_argument("--claim", choices=["head", "random", "dispatch", "adaptive"], default="dispatch")
+    parser.add_argument("--well-capacity", type=int, default=None,
+                        help="number of double-stack wells; set below demand to force rollovers")
+    parser.add_argument("--cutoff-minutes", type=float, default=60.0)
+    parser.add_argument("--block-size", type=int, default=100)
+    parser.add_argument("--max-tiers", type=int, default=3)
+    parser.add_argument("--policy-file", default="adaptive_policy.json",
+                        help="persistent online-learning state used by --claim adaptive")
     parser.add_argument("--unsafe", action="store_true")
     parser.add_argument("--speed", type=float, default=0.01)
     parser.add_argument("--verbose", action="store_true")
@@ -332,5 +405,10 @@ if __name__ == "__main__":
 
     res = run_shift(containers=args.containers, hostlers=args.hostlers, cranes=args.cranes,
                     outgates=args.outgates, claim=args.claim, unsafe=args.unsafe,
-                    speed=args.speed, verbose=args.verbose)
+                    speed=args.speed, verbose=args.verbose,
+                    well_capacity=args.well_capacity, cutoff_minutes=args.cutoff_minutes,
+                    policy_file=args.policy_file if args.claim == 'adaptive' else None,
+                    block_size=args.block_size, max_tiers=args.max_tiers)
     print(render(res))
+    if not args.unsafe and (not res['exactly_once'] or not res['tas_verified']):
+        raise SystemExit(1)

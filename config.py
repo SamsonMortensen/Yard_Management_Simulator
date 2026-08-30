@@ -21,6 +21,7 @@ TABLE_NAME = os.environ.get("YMS_TABLE", "Yard_Inventory_Sim")
 MIN_SPOT = 1000
 MAX_SPOT = 5000
 YARD_CAPACITY = MAX_SPOT - MIN_SPOT + 1  # 4001 numbered spots
+BLOCK_SIZE = int(os.environ.get("YMS_BLOCK_SIZE", "100"))
 
 #Backend selection. Default is real DynamoDB; set YMS_BACKEND=memory to run the
 #engines against the in-memory table in mock_dynamo.py instead. The engines never

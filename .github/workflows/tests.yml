@@ -34,7 +34,9 @@ jobs:
           pip install -r requirements.txt
 
       - name: Test suite
-        run: python test_yard.py
+        run: |
+          python -m pytest -q
+          python test_yard.py
 
       # A shift must complete correctly, not merely without raising. simulate.py
       # exits non-zero if exactly-once is violated or the TAS lets a dry run
@@ -47,6 +49,12 @@ jobs:
 
       - name: Full shift, centralized dispatch
         run: python simulate.py --containers 40 --hostlers 3 --speed 0 --claim dispatch
+
+      - name: Binding train capacity and adaptive dispatch
+        run: python simulate.py --containers 40 --hostlers 3 --cranes 2 --speed 0 --claim adaptive --well-capacity 8 --max-tiers 3 --policy-file adaptive_policy_ci.json
+
+      - name: Reproducible scale experiment
+        run: python scale_experiment.py --sizes 100 --runs 1 --strategies dispatch adaptive --seed 20000 --well-capacity 33 --reset-policy --policy-file scale_policy_ci.json --output scale_experiment_ci.csv
 
       # Rail arrivals go through the crane, stack precedence and the buffer, which
       # the single-crane default barely exercises. Two cranes and four hostlers put

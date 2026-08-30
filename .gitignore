@@ -212,6 +212,19 @@ __marimo__/
 # Simulator run outputs. Regenerated on every run, so they are noise in a diff.
 occupancy_*.csv
 *_out.txt
+adaptive_policy.json
+*_policy.json
+audit*.csv
+physical_*.csv
+small.csv
+scale_experiment*.csv
+scale_smoke.csv
+scale_policy*.json
+policy_thread_verify.json
+
+# Local AWS and Streamlit state must never be committed.
+.aws/
+secrets.toml
 
 # Deliberately NOT ignored:
 #   historical_manifest.csv  pins the exact dataset the README numbers came from

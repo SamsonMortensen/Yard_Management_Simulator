@@ -47,6 +47,7 @@ rather than merely asserted.
 import re
 import threading
 from copy import deepcopy
+from datetime import datetime, timezone
 
 from botocore.exceptions import ClientError
 
@@ -204,6 +205,8 @@ class MockTable:
         self.key_name = key_name
         self.page_size = page_size
         self._items = {}  # key -> item dict
+        self._events = []
+        self._event_sequence = 0
         self._lock = threading.Lock()
 
         # Telemetry: counts operations to support simulate.py and tests
@@ -224,12 +227,32 @@ class MockTable:
     def clear(self):
         with self._lock:
             self._items.clear()
+            self._events.clear()
+            self._event_sequence = 0
             for k in self.stats:
                 self.stats[k] = 0
 
     def all_items(self):
         with self._lock:
             return [deepcopy(v) for v in self._items.values()]
+
+    def all_events(self):
+        with self._lock:
+            return deepcopy(self._events)
+
+    def _record_transition(self, key_val, before, after, item):
+        if before == after or after is None or str(key_val).startswith(("SPOT#", "GROUND#")):
+            return
+        self._event_sequence += 1
+        self._events.append({
+            "sequence": self._event_sequence,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "container_id": key_val,
+            "planned_departure_mode": item.get("Planned_Departure_Mode"),
+            "from_status": before,
+            "to_status": after,
+            "handled_by": item.get("Claimed_By") or item.get("Parked_By_Employee"),
+        })
 
     def get_item(self, Key):
         key_val = Key.get(self.key_name)
@@ -267,6 +290,7 @@ class MockTable:
                     raise _conditional_check_failed("PutItem")
 
             self._items[key_val] = deepcopy(Item)
+            self._record_transition(key_val, None, Item.get("Current_Status"), Item)
             return {"ResponseMetadata": {"HTTPStatusCode": 200}}
 
     def update_item(self, Key, UpdateExpression, ExpressionAttributeValues,
@@ -298,8 +322,89 @@ class MockTable:
             if ExpressionAttributeValues and "Parked" in ExpressionAttributeValues.values():
                 self.stats["successful_parks"] = self.stats.get("successful_parks", 0) + 1
             self._items[key_val] = updated
+            self._record_transition(
+                key_val, item.get("Current_Status"), updated.get("Current_Status"), updated
+            )
             return {"Attributes": deepcopy(updated),
                     "ResponseMetadata": {"HTTPStatusCode": 200}}
+
+    def atomic_update_and_delete(self, Key, UpdateExpression,
+                                 ExpressionAttributeValues, ConditionExpression,
+                                 DeleteKey):
+        """Mock DynamoDB transaction used when a move frees a ground slot."""
+        key_val = Key.get(self.key_name)
+        delete_val = DeleteKey.get(self.key_name)
+        with self._lock:
+            self.stats["updates"] += 1
+            item = self._items.get(key_val)
+            if item is None or not matches(item, ConditionExpression):
+                self.stats["update_conflicts"] += 1
+                raise _conditional_check_failed("TransactWriteItems")
+            updated = deepcopy(item)
+            _apply_set_expression(updated, UpdateExpression, ExpressionAttributeValues)
+            if "Parked" in ExpressionAttributeValues.values():
+                self.stats["successful_parks"] = self.stats.get("successful_parks", 0) + 1
+            self._items[key_val] = updated
+            self._items.pop(delete_val, None)
+            self._record_transition(
+                key_val, item.get("Current_Status"), updated.get("Current_Status"), updated
+            )
+            return {"ResponseMetadata": {"HTTPStatusCode": 200}}
+
+    def atomic_batch_update(self, updates):
+        """Validate and apply all train departure updates under one lock."""
+        with self._lock:
+            prepared = []
+            for request in updates:
+                key_val = request["Key"].get(self.key_name)
+                item = self._items.get(key_val)
+                if item is None or not matches(item, request.get("ConditionExpression")):
+                    self.stats["update_conflicts"] += 1
+                    raise _conditional_check_failed("TransactWriteItems")
+                updated = deepcopy(item)
+                _apply_set_expression(
+                    updated,
+                    request["UpdateExpression"],
+                    request["ExpressionAttributeValues"],
+                )
+                prepared.append((key_val, item, updated))
+            self.stats["updates"] += len(prepared)
+            for key_val, item, updated in prepared:
+                self._items[key_val] = updated
+                self._record_transition(
+                    key_val, item.get("Current_Status"), updated.get("Current_Status"), updated
+                )
+            return {"ResponseMetadata": {"HTTPStatusCode": 200}}
+
+    def atomic_relocate(self, Key, UpdateExpression, ExpressionAttributeValues,
+                        ConditionExpression, OldReservationKey, NewReservationItem):
+        """Atomically move a parked blocker and exchange its ground reservation."""
+        key_val = Key[self.key_name]
+        old_key = OldReservationKey[self.key_name]
+        new_key = NewReservationItem[self.key_name]
+        with self._lock:
+            item = self._items.get(key_val)
+            if item is None or not matches(item, ConditionExpression) or new_key in self._items:
+                self.stats["update_conflicts"] += 1
+                raise _conditional_check_failed("TransactWriteItems")
+            updated = deepcopy(item)
+            _apply_set_expression(updated, UpdateExpression, ExpressionAttributeValues)
+            self.stats["updates"] += 1
+            self.stats["puts"] += 1
+            self._items[new_key] = deepcopy(NewReservationItem)
+            self._items[key_val] = updated
+            self._items.pop(old_key, None)
+            self._event_sequence += 1
+            self._events.append({
+                "sequence": self._event_sequence,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "container_id": key_val,
+                "event_type": "Ground_Rehandle",
+                "from_location": old_key,
+                "to_location": new_key,
+                "handled_by": ExpressionAttributeValues.get(':employee'),
+            })
+            return {"ResponseMetadata": {"HTTPStatusCode": 200}}
 
     def scan(self, FilterExpression=None, ProjectionExpression=None,
              ExclusiveStartKey=None, Limit=None):

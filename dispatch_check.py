@@ -10,15 +10,16 @@ Denied for the cases that would waste the trip:
                          the whole thing exists to prevent.
   still on the train     Trackside_Hold, Buffer_Hold, Rendezvous_Wait or
                          Claimed. It is here but nobody can hand it over yet.
-  Direction is Export    it is staged for a train, not for a customer.
+  railbound              it is staged for a train, not for a customer.
   already departed       somebody already took it.
   anything unrecognized  deny and send it to the tower rather than guess.
 
-Approved only for a Parked Import. On the ground, and waiting for pickup.
+Approved only for a parked roadbound unit. On the ground, waiting for pickup.
 """
 from botocore.exceptions import ClientError
 
 from config import get_table
+from flow import is_railbound
 
 table = get_table()
 
@@ -39,12 +40,10 @@ def check_appointment(container_id):
         item = response['Item']
         status = item.get('Current_Status')
         spot = item.get('Assigned_Spot')
-        direction = item.get('Direction', 'Import')
-
-        # Edge Case 2: Outbound export unit staged for train, not customer pickup
-        if direction == 'Export':
+        # Edge Case 2: Railbound unit staged for train, not customer pickup
+        if is_railbound(item):
             print("Appointment Denied.")
-            print("Reason: Unit is an outbound export container staged for rail, not customer road pickup.\n")
+            print("Reason: Unit is railbound and staged for train departure, not road pickup.\n")
             return False
 
         # Edge Case 3: In yard, but not grounded / still holding

@@ -30,6 +30,7 @@ from boto3.dynamodb.conditions import Attr
 from botocore.exceptions import ClientError
 
 from config import get_table, query_status
+from flow import is_railbound
 import train
 
 table = get_table()
@@ -57,6 +58,9 @@ def claim_strategy():
 
 def is_unsafe():
     return os.environ.get("YMS_UNSAFE", "false").lower() == "true"
+
+def uses_atomic_claim():
+    return claim_strategy() in ("dispatch", "adaptive")
 
 def sweep_mode():
     return os.environ.get("YMS_SWEEP_MODE", "tops_first").lower()
@@ -95,7 +99,7 @@ def move_container():
             container_id = None
             assigned_spot = None
 
-            if strategy == "dispatch" and not unsafe:
+            if uses_atomic_claim() and not unsafe:
                 for candidate in eligible_items:
                     candidate_id = candidate['Container_ID']
                     try:
@@ -146,7 +150,7 @@ def move_container():
 
             is_coupled = (random.random() < 0.5) if os.environ.get('YMS_SWEEP_BENCHMARK') != 'true' else False
             next_status = 'Rendezvous_Wait' if is_coupled else 'Buffer_Hold'
-            expected_status = 'Trackside_Hold' if strategy != "dispatch" else 'Claimed'
+            expected_status = 'Claimed' if uses_atomic_claim() else 'Trackside_Hold'
 
             if unsafe:
                 table.update_item(
@@ -175,26 +179,26 @@ def move_container():
     if awaiting_items:
         outbound_train = train.get_outbound_train()
         
-        # Enforce Inverted Loading Precedence: Bottoms must be loaded before Tops
+        # The train planner filters by well length, stack weight, destination
+        # block, and bottom/top support before the crane claims a unit.
         eligible_for_loading = []
         for item in awaiting_items:
-            car_id = item.get('Railcar_ID', 'TTZX00001')
-            pos = item.get('Well_Position', 'Bottom')
-            can_load, reason = outbound_train.can_load(car_id, pos)
-            if can_load:
-                eligible_for_loading.append(item)
+            plan = outbound_train.find_load_plan(item)
+            if plan:
+                eligible_for_loading.append((item, plan))
 
         if not eligible_for_loading:
             return False
 
-        # Sort so Bottoms load first
-        eligible_for_loading.sort(key=lambda x: 0 if x.get('Well_Position') in ['Bottom', 'Single'] else 1)
+        eligible_for_loading.sort(
+            key=lambda entry: 1 if entry[1][1] == 'Top' else 0
+        )
 
         container = None
         container_id = None
 
-        if strategy == "dispatch" and not unsafe:
-            for candidate in eligible_for_loading:
+        if uses_atomic_claim() and not unsafe:
+            for candidate, _ in eligible_for_loading:
                 candidate_id = candidate['Container_ID']
                 try:
                     table.update_item(
@@ -214,11 +218,23 @@ def move_container():
             if not container_id:
                 return True
         else:
-            container = random.choice(eligible_for_loading) if strategy == "random" else eligible_for_loading[0]
+            container = (
+                random.choice(eligible_for_loading)[0]
+                if strategy == "random" else eligible_for_loading[0][0]
+            )
             container_id = container['Container_ID']
 
-        car_id = container.get('Railcar_ID', 'TTZX00001')
-        pos = container.get('Well_Position', 'Bottom')
+        plan = outbound_train.find_load_plan(container)
+        if plan is None:
+            if uses_atomic_claim():
+                table.update_item(
+                    Key={'Container_ID': container_id},
+                    UpdateExpression="set Current_Status = :s",
+                    ExpressionAttributeValues={':s': 'Awaiting_Rail'},
+                    ConditionExpression=Attr('Current_Status').eq('Claimed')
+                )
+            return True
+        car_id, pos = plan
 
         hoist_time = 45.0
         cycle_time = hoist_time + crane_travel_delay()
@@ -229,31 +245,69 @@ def move_container():
         if cycle_time > 0 and os.environ.get('YMS_SWEEP_BENCHMARK') != 'true':
             time.sleep(cycle_time)
 
-        expected_status = 'Awaiting_Rail' if strategy != "dispatch" else 'Claimed'
+        expected_status = 'Claimed' if uses_atomic_claim() else 'Awaiting_Rail'
 
         if unsafe:
+            try:
+                outbound_train.load_container(
+                    car_id, pos, container_id,
+                    container.get('Equipment_Type'),
+                    container.get('Gross_Weight_Lbs'),
+                    container.get('Destination_Block'),
+                )
+            except ValueError:
+                return True
             table.update_item(
                 Key={'Container_ID': container_id},
-                UpdateExpression="set Current_Status = :s, Parked_By_Employee = :e",
-                ExpressionAttributeValues={':s': 'Loaded_Rail', ':e': driver}
+                UpdateExpression=(
+                    "set Current_Status = :s, Parked_By_Employee = :e, "
+                    "Railcar_ID = :c, Well_Position = :p"
+                ),
+                ExpressionAttributeValues={
+                    ':s': 'Loaded_Rail', ':e': driver, ':c': car_id, ':p': pos,
+                }
             )
-            outbound_train.load_container(car_id, pos, container_id)
-            print(f"[UNSAFE] Loaded export {container_id} onto railcar {car_id} ({pos})\n")
+            print(f"[UNSAFE] Loaded railbound unit {container_id} onto railcar {car_id} ({pos})\n")
             return True
 
+        slot_reserved = False
         try:
+            outbound_train.load_container(
+                car_id, pos, container_id,
+                container.get('Equipment_Type'),
+                container.get('Gross_Weight_Lbs'),
+                container.get('Destination_Block'),
+            )
+            slot_reserved = True
             table.update_item(
                 Key={'Container_ID': container_id},
-                UpdateExpression="set Current_Status = :s, Parked_By_Employee = :e",
+                UpdateExpression=(
+                    "set Current_Status = :s, Parked_By_Employee = :e, "
+                    "Railcar_ID = :c, Well_Position = :p"
+                ),
                 ConditionExpression=Attr('Current_Status').eq(expected_status),
-                ExpressionAttributeValues={':s': 'Loaded_Rail', ':e': driver}
+                ExpressionAttributeValues={
+                    ':s': 'Loaded_Rail', ':e': driver, ':c': car_id, ':p': pos,
+                }
             )
-            outbound_train.load_container(car_id, pos, container_id)
-            print(f"Loaded export {container_id} onto railcar {car_id} ({pos}) by {driver}\n")
+            print(f"Loaded railbound unit {container_id} onto railcar {car_id} ({pos}) by {driver}\n")
         except ClientError as e:
+            if slot_reserved:
+                outbound_train.unload_container(car_id, pos, container_id)
             if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
                 return True
             raise
+        except ValueError:
+            # Another crane reserved this physical slot first. The claimed unit
+            # is returned to Awaiting_Rail so a later valid slot can take it.
+            if uses_atomic_claim():
+                table.update_item(
+                    Key={'Container_ID': container_id},
+                    UpdateExpression="set Current_Status = :s",
+                    ExpressionAttributeValues={':s': 'Awaiting_Rail'},
+                    ConditionExpression=Attr('Current_Status').eq('Claimed')
+                )
+            return True
 
         return True
 
@@ -264,11 +318,15 @@ def run_shift():
     while empty_passes < 10:
         moved = move_container()
         if not moved:
-            if query_status(table, ['Trackside_Hold', 'Buffer_Hold', 'Rendezvous_Wait', 'Ingate_Hold', 'Awaiting_Rail', 'Claimed']):
+            active = query_status(table, ['Trackside_Hold', 'Buffer_Hold', 'Rendezvous_Wait', 'Ingate_Hold', 'Claimed'])
+            awaiting = query_status(table, ['Awaiting_Rail'])
+            outbound_train = train.get_outbound_train()
+            loadable = any(outbound_train.find_load_plan(item) for item in awaiting)
+            if active or loadable:
                 time.sleep(0.05)
                 continue
             parked = query_status(table, ['Parked'])
-            if any(item.get('Direction') == 'Export' for item in parked):
+            if any(is_railbound(item) for item in parked):
                 time.sleep(0.05)
                 continue
             empty_passes += 1
