@@ -3,7 +3,7 @@
 [![Tests](https://github.com/SamsonMortensen/Yard_Management_Simulator/actions/workflows/tests.yml/badge.svg)](https://github.com/SamsonMortensen/Yard_Management_Simulator/actions/workflows/tests.yml)
 [![Python 3.10 and 3.12](https://img.shields.io/badge/python-3.10%20%7C%203.12-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Release: v0.2.0](https://img.shields.io/badge/release-v0.2.0-orange.svg)](CHANGELOG.md)
+[![Release: v0.2.0](https://img.shields.io/badge/release-v0.2.0-orange.svg)](RELEASE_NOTES.md)
 
 **Current release:** v0.2.0, Physical Yard and Adaptive Dispatch
 
@@ -319,7 +319,7 @@ data.
 | `adaptive_policy.py` | Persistent online dispatch learner with safety boundaries |
 | `transition_audit.py` | Per-container ordered lifecycle validation |
 | `atomic_ops.py` | Transactional departure/release and blocker relocation |
-| `CHANGELOG.md` | Summary of the terminology, correctness, and learning upgrade |
+| `RELEASE_NOTES.md` | Scope and verification record for the public release |
 | `test_yard.py` | Unit, concurrency, physical, lifecycle, and learning tests |
 | `build_manifest.py` | Builds a day's manifest from real port volume |
 | `demand_forecast.py` | Supervised and unsupervised models on BTS port data |
@@ -366,7 +366,7 @@ bearing, so shortening the run costs you the result.
   departures, online adaptive dispatch, lifecycle auditing, and public CI.
 - Future work: broader physical track and train-footage planning.
 
-See [CHANGELOG.md](CHANGELOG.md) for the detailed upgrade record.
+See [RELEASE_NOTES.md](RELEASE_NOTES.md) for the public release record.
 
 ### Note on single table design
 
