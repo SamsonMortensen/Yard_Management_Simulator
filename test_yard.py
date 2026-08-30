@@ -315,8 +315,9 @@ def test_unsafe_mode_causes_data_corruption():
     import simulate
     result = simulate.run_shift(containers=20, hostlers=3, cranes=2, outgates=1,
                                 claim="head", unsafe=True, speed=0.0, seed=7)
-    check("unsafe run reported 0 conflicts because writes were blind",
-          result["park_conflicts"] == 0, f"conflicts: {result['park_conflicts']}")
+    check("blind updates create duplicate parking writes",
+          result["double_park_writes"] > 0,
+          f"duplicate writes: {result['double_park_writes']}")
 
 
 def test_claim_strategy_changes_contention():

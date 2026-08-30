@@ -83,6 +83,7 @@ python simulate.py --max-tiers 4          # change ground stack height
 python simulate.py --block-size 80        # change travel distance between yard blocks
 python simulate.py --cranes 2 --hostlers 4
 python simulate.py --verbose              # show the engines' own output
+pip install -r requirements-dev.txt       # add the verification tools
 python -m pytest -q                       # 29 automated tests
 python test_yard.py                       # 77 narrated assertions
 python scale_experiment.py --runs 5       # matched scale and learning experiment

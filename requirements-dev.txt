@@ -1,0 +1,4 @@
+-r requirements.txt
+
+# Test runner used by the automated verification suite and GitHub Actions.
+pytest>=8.0
